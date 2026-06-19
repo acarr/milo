@@ -124,6 +124,10 @@ export interface MiloClient {
   daemon(): DaemonStatus;
   repoHealth(): RepoHealthView;
   schedules(): Promise<SchedulesView>;
+  /** Run one Linear+GitHub poll pass, enqueuing any new work. */
+  pollNow(): Promise<ActionResult<{ linear: number; github: number }>>;
+  /** Run a scheduled prompt now by (possibly namespaced) name. */
+  runPrompt(name: string): Promise<ActionResult<{ jobId: string; disposition: string }>>;
   /** Re-run a finished job as a new job (revises the existing PR for shipped Linear/GitHub work). */
   rerun(jobId: string): ActionResult<Job>;
   /** Retry a failed/needs-attention/abandoned job in place. */
@@ -249,6 +253,39 @@ export function createClient(opts: { store?: JobStore; db?: Db; config?: MiloCon
     retry(jobId): ActionResult<Job> {
       try {
         return { ok: true, value: theStore.retry(jobId) };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    },
+
+    async pollNow(): Promise<ActionResult<{ linear: number; github: number }>> {
+      const config = getConfig();
+      if (!config) return { ok: false, error: "no config" };
+      try {
+        const { LinearClient } = await import("@milo/core");
+        const { pollOnce } = await import("@milo/daemon");
+        const linear = LinearClient.fromConfig();
+        const value = await pollOnce({ config, store: theStore, linear });
+        return { ok: true, value };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    },
+
+    async runPrompt(name): Promise<ActionResult<{ jobId: string; disposition: string }>> {
+      const config = getConfig();
+      if (!config) return { ok: false, error: "no config" };
+      try {
+        const { effectiveSchedules } = await import("@milo/daemon");
+        const { resolvePromptScheduleJob } = await import("@milo/core");
+        const defs = effectiveSchedules(config).filter((d) => (d.intent?.["kind"] as string) === "prompt");
+        const matches = defs.filter((d) => d.name === name || d.name.endsWith(`:${name}`));
+        if (matches.length === 0) return { ok: false, error: `no prompt schedule "${name}"` };
+        if (matches.length > 1) return { ok: false, error: `"${name}" is ambiguous` };
+        const def = matches[0]!;
+        const res = theStore.enqueue(resolvePromptScheduleJob(config, def, theStore.lastScheduleRun(def.name)));
+        theStore.recordScheduleRun(def.name, "prompt", `${res.disposition} ${res.job.id} (manual)`);
+        return { ok: true, value: { jobId: res.job.id, disposition: res.disposition } };
       } catch (e) {
         return { ok: false, error: (e as Error).message };
       }

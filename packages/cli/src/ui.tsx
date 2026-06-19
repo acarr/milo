@@ -1,9 +1,18 @@
 import React from "react";
 import { render, Box, Text, useApp, useInput } from "ink";
-import { useState, useEffect } from "react";
-import { openDatabase, JobStore, Scheduler, isDaemonRunning, readDaemon, loadConfig, type Job } from "@milo/core";
+import { useState, useEffect, useRef } from "react";
+import { Scheduler, type PersistedEvent } from "@milo/core";
+import { createClient, type MiloClient, type StateFilter, type SchedulesView as SchedulesData, type ScheduleViewRow } from "./viewmodel.js";
+import { runDoctor, type CheckResult } from "./doctor.js";
+import { Header, Footer } from "./components/index.js";
+import { JobsView } from "./views/jobs.js";
+import { JobDetailView } from "./views/job-detail.js";
+import { TranscriptView } from "./views/transcript.js";
+import { SchedulesView } from "./views/schedules.js";
+import { SystemView } from "./views/system.js";
+import type { JobRow, RepoHealthRow } from "./viewmodel.js";
 
-/** A schedule row for the TUI's Scheduled panel (name/cron/kind + enabled). */
+/** A schedule row injected directly into the TUI (test convenience; live data comes from the client). */
 export interface ScheduleRow {
   name: string;
   cron: string;
@@ -11,156 +20,275 @@ export interface ScheduleRow {
   enabled: boolean;
 }
 
-const STATE_COLOR: Record<string, string> = {
-  done: "green",
-  "discovery-done": "green",
-  running: "cyan",
-  verifying: "cyan",
-  "setting-up": "cyan",
-  reporting: "cyan",
-  remediating: "magenta",
-  queued: "yellow",
-  claimed: "yellow",
-  retrying: "yellow",
-  failed: "red",
-  "needs-attention": "red",
-  abandoned: "red",
+/** The view stack: the root is `jobs`; drilling in pushes detail/transcript. */
+type View =
+  | { name: "jobs" }
+  | { name: "job-detail"; jobId: string }
+  | { name: "transcript"; jobId: string }
+  | { name: "schedules" }
+  | { name: "system" };
+
+const STATE_CYCLE: (StateFilter | undefined)[] = [undefined, "active", "failed", "needs-attention", "cancelled", "done"];
+
+const HINTS: Record<string, string> = {
+  jobs: "↑/↓ select · ⏎ detail · t transcript · r rerun · R retry · x cancel · p poll · / search · f filter · 1/2/3 views · q quit",
+  "jobs-filter": "type to filter · ⏎ apply · esc clear",
+  "job-detail": "t transcript · r rerun · R retry · x cancel · esc back · q quit",
+  transcript: "esc back · q quit",
+  schedules: "↑/↓ select · ⏎/p run now · 1/2/3 views · q quit",
+  system: "d run doctor · p poll · 1/2/3 views · q quit",
 };
 
-function age(ts: number, now: number): string {
-  const s = Math.max(0, Math.floor((now - ts) / 1000));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  return `${Math.floor(m / 60)}h`;
-}
-
-export function App({ store, schedules = [] }: { store: JobStore; schedules?: ScheduleRow[] }) {
+export function App({
+  client: providedClient,
+  store,
+  schedules: schedulesProp,
+}: {
+  client?: MiloClient;
+  store?: import("@milo/core").JobStore;
+  schedules?: ScheduleRow[];
+}) {
   const { exit } = useApp();
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [counts, setCounts] = useState<Record<string, number>>({});
-  const [daemon, setDaemon] = useState(false);
-  const [pid, setPid] = useState<number | undefined>(undefined);
-  const [sel, setSel] = useState(0);
-  const [now, setNow] = useState(Date.now());
-  const [events, setEvents] = useState<{ seq: number; kind: string; from: string | null; to: string | null }[]>([]);
-  const [schedRuns, setSchedRuns] = useState<Record<string, number | undefined>>({});
+  const clientRef = useRef<MiloClient>(providedClient ?? createClient({ store }));
+  const client = clientRef.current;
 
+  const [stack, setStack] = useState<View[]>([{ name: "jobs" }]);
+  const top = stack[stack.length - 1]!;
+  const push = (v: View) => setStack((s) => [...s, v]);
+  const pop = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
+
+  const [rows, setRows] = useState<JobRow[]>([]);
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [daemon, setDaemon] = useState<{ running: boolean; pid?: number }>({ running: false });
+  const [health, setHealth] = useState<RepoHealthRow[]>([]);
+  const [now, setNow] = useState(Date.now());
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [filtering, setFiltering] = useState(false);
+  const [filterText, setFilterText] = useState("");
+  const [stateFilter, setStateFilter] = useState<StateFilter | undefined>(undefined);
+  const [message, setMessage] = useState("");
+  const [transcript, setTranscript] = useState<PersistedEvent[]>([]);
+  const [sched, setSched] = useState<SchedulesData>({ rows: [], recent: [] });
+  const [schedSel, setSchedSel] = useState(0);
+  const [doctor, setDoctor] = useState<CheckResult[] | null>(null);
+
+  const filterRef = useRef<{ search?: string; state?: StateFilter }>({});
+
+  const refresh = () => {
+    setRows(client.jobs({ limit: 300, ...filterRef.current }));
+    const d = client.daemon();
+    setDaemon({ running: d.running, pid: d.pid });
+    setCounts(d.counts);
+    setHealth(client.repoHealth().rows);
+    setNow(Date.now());
+  };
+
+  // Single 1s poll feeds the jobs/system views. The transcript view ignores it (push-only below).
   useEffect(() => {
-    const tick = () => {
-      setJobs(store.list({ limit: 50 }));
-      setCounts(store.countByState());
-      setDaemon(isDaemonRunning());
-      setPid(readDaemon()?.pid);
-      setNow(Date.now());
-      if (schedules.length) {
-        setSchedRuns(Object.fromEntries(schedules.map((s) => [s.name, store.lastScheduleRun(s.name)])));
-      }
-    };
-    tick();
-    const id = setInterval(tick, 1000);
+    refresh();
+    const id = setInterval(refresh, 1000);
     return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Live transcript: subscribe while the transcript view is on top; replay + tail into local state.
+  const transcriptKey = top.name === "transcript" ? top.jobId : null;
   useEffect(() => {
-    const job = jobs[Math.min(sel, jobs.length - 1)];
-    if (job) setEvents(store.events(job.id, 8));
-  }, [sel, jobs]);
+    if (!transcriptKey) return;
+    const acc: PersistedEvent[] = [];
+    setTranscript([]);
+    const unsub = client.tailTranscript(transcriptKey, (e) => {
+      acc.push(e);
+      setTranscript([...acc]);
+    });
+    return () => unsub();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transcriptKey]);
 
+  // Fetch schedules when the schedules view opens (unless injected via the prop, for tests).
+  const onSchedules = top.name === "schedules";
+  useEffect(() => {
+    if (!onSchedules || (schedulesProp && schedulesProp.length)) return;
+    let live = true;
+    void client.schedules().then((sv) => {
+      if (live) setSched(sv);
+    });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onSchedules]);
+
+  // --- derived ---
+  const selId = rows.find((r) => r.id === selectedId)?.id ?? rows[0]?.id ?? null;
+  const detail = top.name === "job-detail" || top.name === "transcript" ? client.job(top.jobId) : undefined;
+  const schedView: SchedulesData =
+    schedulesProp && schedulesProp.length
+      ? {
+          rows: schedulesProp.map<ScheduleViewRow>((s) => ({
+            name: s.name,
+            cron: s.cron,
+            kind: s.kind,
+            enabled: s.enabled,
+            nextRun: s.enabled ? Scheduler.nextRun(s.cron) : null,
+            lastRun: client.store.lastScheduleRun(s.name) ?? null,
+          })),
+          recent: [],
+        }
+      : sched;
+  const schedIdx = Math.min(schedSel, Math.max(0, schedView.rows.length - 1));
+
+  // --- actions ---
+  const act = (kind: "rerun" | "retry" | "cancel", jobId: string | null) => {
+    if (!jobId) return;
+    const r = kind === "rerun" ? client.rerun(jobId) : kind === "retry" ? client.retry(jobId) : client.cancel(jobId);
+    setMessage(r.ok ? `${kind}: ${typeof r.value === "string" ? r.value : `job ${r.value.id.slice(-6)}`}` : `${kind} failed: ${r.error}`);
+    refresh();
+  };
+  const doPoll = () => {
+    setMessage("polling Linear + GitHub…");
+    void client.pollNow().then((r) => {
+      setMessage(r.ok ? `polled: linear=${r.value.linear} github=${r.value.github}` : `poll failed: ${r.error}`);
+      refresh();
+    });
+  };
+  const runSchedule = () => {
+    const def = schedView.rows[schedIdx];
+    if (!def || def.kind !== "prompt") {
+      setMessage("select a prompt schedule to run");
+      return;
+    }
+    void client.runPrompt(def.name).then((r) => {
+      setMessage(r.ok ? `queued ${r.value.disposition} (job ${r.value.jobId.slice(-6)})` : `run failed: ${r.error}`);
+      refresh();
+    });
+  };
+  const moveSel = (delta: number) => {
+    // Functional update so rapid presses don't all read the same (stale) selection before re-render.
+    setSelectedId((prev) => {
+      if (rows.length === 0) return prev;
+      const cur = Math.max(0, rows.findIndex((r) => r.id === (prev ?? rows[0]?.id)));
+      return rows[Math.min(rows.length - 1, Math.max(0, cur + delta))]!.id;
+    });
+  };
+  const cycleStateFilter = () => {
+    const i = STATE_CYCLE.findIndex((s) => s === stateFilter);
+    const next = STATE_CYCLE[(i + 1) % STATE_CYCLE.length];
+    setStateFilter(next);
+    filterRef.current.state = next;
+    refresh();
+  };
+
+  // --- input (single handler, dispatched by view + mode) ---
   useInput((input, key) => {
-    if (input === "q") exit();
-    else if (key.upArrow) setSel((s) => Math.max(0, s - 1));
-    else if (key.downArrow) setSel((s) => Math.min(Math.max(0, jobs.length - 1), s + 1));
+    if (top.name === "jobs" && filtering) {
+      if (key.escape) {
+        setFiltering(false);
+        setFilterText("");
+        filterRef.current.search = undefined;
+        refresh();
+      } else if (key.return) {
+        setFiltering(false);
+      } else if (key.backspace || key.delete) {
+        const t = filterText.slice(0, -1);
+        setFilterText(t);
+        filterRef.current.search = t || undefined;
+        refresh();
+      } else if (input && !key.ctrl && !key.meta) {
+        const t = filterText + input;
+        setFilterText(t);
+        filterRef.current.search = t || undefined;
+        refresh();
+      }
+      return;
+    }
+
+    if (input === "q") return exit();
+    if (key.escape || key.backspace) {
+      if (stack.length > 1) pop();
+      return;
+    }
+    if (input === "1") return setStack([{ name: "jobs" }]);
+    if (input === "2") return setStack([{ name: "schedules" }]);
+    if (input === "3") return setStack([{ name: "system" }]);
+
+    if (top.name === "jobs") {
+      if (key.upArrow) return moveSel(-1);
+      if (key.downArrow) return moveSel(1);
+      if (key.return && selId) return push({ name: "job-detail", jobId: selId });
+      if (input === "t" && selId) return push({ name: "transcript", jobId: selId });
+      if (input === "r" && selId) return act("rerun", selId);
+      if (input === "R" && selId) return act("retry", selId);
+      if (input === "x" && selId) return act("cancel", selId);
+      if (input === "p") return doPoll();
+      if (input === "/") return setFiltering(true);
+      if (input === "f") return cycleStateFilter();
+      return;
+    }
+    if (top.name === "job-detail") {
+      if (input === "t") return push({ name: "transcript", jobId: top.jobId });
+      if (input === "r") return act("rerun", top.jobId);
+      if (input === "R") return act("retry", top.jobId);
+      if (input === "x") return act("cancel", top.jobId);
+      return;
+    }
+    if (top.name === "schedules") {
+      if (key.upArrow) return setSchedSel((s) => Math.max(0, s - 1));
+      if (key.downArrow) return setSchedSel((s) => Math.min(schedView.rows.length - 1, s + 1));
+      if (key.return || input === "p") return runSchedule();
+      return;
+    }
+    if (top.name === "system") {
+      if (input === "d") {
+        // runDoctor is synchronous (it shells out) — defer a tick so the hint paints before it blocks.
+        setMessage("running environment checks…");
+        setTimeout(() => {
+          setDoctor(runDoctor());
+          setMessage("");
+        }, 0);
+        return;
+      }
+      if (input === "p") return doPoll();
+      return;
+    }
   });
 
-  const selected = jobs[Math.min(sel, Math.max(0, jobs.length - 1))];
+  const hintKey = top.name === "jobs" && filtering ? "jobs-filter" : top.name;
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <Box>
-        <Text bold>milo </Text>
-        <Text color={daemon ? "green" : "yellow"}>{daemon ? `● daemon running (pid ${pid})` : "○ daemon stopped"}</Text>
-        <Text dimColor>{"   "}{Object.entries(counts).map(([s, c]) => `${s}:${c}`).join("  ") || "no jobs"}</Text>
-      </Box>
-
-      <Box marginTop={1} flexDirection="column">
-        {jobs.length === 0 && <Text dimColor>no jobs yet — try `milo SBX-1`</Text>}
-        {jobs.map((j, i) => (
-          <Box key={j.id}>
-            <Text color={i === sel ? "cyan" : undefined}>{i === sel ? "› " : "  "}</Text>
-            <Text>{(j.entityRef ?? j.entityId).padEnd(8)} </Text>
-            <Text color={STATE_COLOR[j.state] ?? "white"}>{j.state.padEnd(15)}</Text>
-            <Text dimColor>{(j.runner ?? "-").padEnd(7)}{age(j.createdAt, now).padStart(4)}  </Text>
-            <Text dimColor>{j.prUrl ?? j.failureDetail ?? ""}</Text>
-          </Box>
-        ))}
-      </Box>
-
-      {selected && (
-        <Box marginTop={1} flexDirection="column" borderStyle="round" paddingX={1}>
-          <Text>
-            <Text bold>{selected.entityRef ?? selected.entityId}</Text>
-            <Text color={STATE_COLOR[selected.state] ?? "white"}> {selected.state}</Text>
-          </Text>
-          {selected.summary ? <Text dimColor>{selected.summary}</Text> : null}
-          {events.map((e) => (
-            <Text key={e.seq} dimColor>
-              {e.kind}
-              {e.from || e.to ? ` ${e.from ?? ""}→${e.to ?? ""}` : ""}
-            </Text>
-          ))}
-        </Box>
+      <Header daemon={daemon.running} pid={daemon.pid} counts={counts} />
+      {top.name === "jobs" && (
+        <JobsView rows={rows} selectedId={selId} filtering={filtering} filterText={filterText} stateFilter={stateFilter} />
       )}
-
-      {schedules.length > 0 && (
-        <Box marginTop={1} flexDirection="column">
-          <Text bold dimColor>Scheduled</Text>
-          {schedules.map((s) => {
-            const next = s.enabled ? Scheduler.nextRun(s.cron) : null;
-            const last = schedRuns[s.name];
-            return (
-              <Box key={s.name}>
-                <Text>{"  "}{(s.enabled ? s.name : `${s.name} (off)`).padEnd(16)}</Text>
-                <Text dimColor>{s.kind.padEnd(12)}{s.cron.padEnd(14)}</Text>
-                <Text dimColor>next {next ? `in ${age(now, next)}` : "—"}   last {last ? `${age(last, now)} ago` : "—"}</Text>
-              </Box>
-            );
-          })}
-        </Box>
+      {top.name === "job-detail" && detail && <JobDetailView detail={detail} />}
+      {top.name === "transcript" && (
+        <TranscriptView
+          label={detail?.job.entityRef ?? detail?.job.entityId ?? top.jobId}
+          state={detail?.job.state ?? "?"}
+          events={transcript}
+        />
       )}
-
-      <Box marginTop={1}>
-        <Text dimColor>↑/↓ select · q quit · live (1s)</Text>
-      </Box>
+      {top.name === "schedules" && (
+        <SchedulesView rows={schedView.rows} selectedIndex={schedIdx} recent={schedView.recent} now={now} />
+      )}
+      {top.name === "system" && <SystemView daemon={client.daemon()} health={health} doctor={doctor} />}
+      <Footer hints={HINTS[hintKey] ?? HINTS["jobs"]!} message={message || undefined} />
     </Box>
   );
 }
 
 /** Launch the interactive TUI (bare `milo` / `milo ui`). Falls back to a static dump when not a TTY. */
 export async function runTui(): Promise<void> {
-  const db = openDatabase();
-  const store = new JobStore(db);
+  const client = createClient();
   if (!process.stdin.isTTY) {
-    for (const j of store.list({ limit: 50 })) {
-      console.log(`${(j.entityRef ?? j.entityId).padEnd(10)} ${j.state.padEnd(16)} ${j.prUrl ?? ""}`);
+    for (const r of client.jobs({ limit: 50 })) {
+      console.log(`${r.ref.padEnd(12)} ${r.state.padEnd(16)} ${r.prUrl ?? r.detail ?? ""}`);
     }
-    db.close();
+    client.close();
     return;
   }
-  let schedules: ScheduleRow[] = [];
-  try {
-    const { config } = loadConfig();
-    const { effectiveSchedules } = await import("@milo/daemon");
-    schedules = effectiveSchedules(config).map((s) => ({
-      name: s.name,
-      cron: s.cron,
-      kind: (s.intent?.["kind"] as string) ?? "enqueue",
-      enabled: s.enabled,
-    }));
-  } catch {
-    /* no/invalid config — show jobs only */
-  }
-  const app = render(<App store={store} schedules={schedules} />);
+  const app = render(<App client={client} />);
   await app.waitUntilExit();
-  db.close();
+  client.close();
 }
