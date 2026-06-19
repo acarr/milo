@@ -1,0 +1,19 @@
+{
+  "name": "@milo/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "croner": "^10.0.1",
+    "pino": "^9.6.0",
+    "ulid": "^2.3.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12"
+  }
+}

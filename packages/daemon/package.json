@@ -1,0 +1,12 @@
+{
+  "name": "@milo/daemon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@milo/core": "workspace:*",
+    "@milo/runners": "workspace:*",
+    "@milo/transports": "workspace:*"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@milo/core": ["packages/core/src/index.ts"],
+      "@milo/core/*": ["packages/core/src/*"],
+      "@milo/transports": ["packages/transports/src/index.ts"],
+      "@milo/runners": ["packages/runners/src/index.ts"],
+      "@milo/daemon": ["packages/daemon/src/index.ts"]
+    }
+  },
+  "include": ["packages/*/src/**/*.ts", "packages/*/src/**/*.tsx", "scripts/**/*.ts"]
+}

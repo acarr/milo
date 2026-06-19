@@ -1,0 +1,26 @@
+{
+  "name": "milo-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "milo": "./bin/milo.mjs"
+  },
+  "scripts": {
+    "milo": "tsx packages/cli/src/index.ts",
+    "doctor": "tsx packages/cli/src/index.ts doctor",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsx scripts/build.ts",
+    "test": "node --import tsx --test packages/*/test/*.test.ts*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "esbuild": "^0.24.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@milo/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "milo": "./src/index.ts"
+  },
+  "dependencies": {
+    "@milo/core": "workspace:*",
+    "@milo/daemon": "workspace:*",
+    "@milo/runners": "workspace:*",
+    "ink": "^5.1.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "ink-testing-library": "^4.0.0"
+  }
+}
