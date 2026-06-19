@@ -81,8 +81,9 @@ GitHub triggers are **opt-in per repo** — only repos with a `githubRepo: "owne
 are polled (this keeps Milo off other tools' shared clones). The GitHub poller (`pollGithub`) watches **open
 PRs** in those repos for:
 
-> The `milo` repo itself is wired for GitHub attach mode (`githubRepo: "acarr/milo"`), so the
-> triggers below fire on milo's own PRs — Milo dogfoods its own PR-feedback loop.
+> GitHub `@milo`/label triggers require a `githubRepo` in config (opt-in polling). The **public
+> `acarr/milo` repo has this disabled** — drive its own work via Linear `MILO` tickets / `milo <ID>`.
+> The triggers below apply to repos that opt in (e.g. a private sandbox).
 
 ### a) The `milo` label on a PR
 → `triggerType: pr.label`, `contentHash: <slug>#<number>:label` (fires once).

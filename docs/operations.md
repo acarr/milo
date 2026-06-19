@@ -31,10 +31,12 @@ via tsx, **restart after pulling new code**.
 
 ### Dogfooding
 
-The `milo` repo itself is wired for GitHub attach mode (`githubRepo: "acarr/milo"`): comment
-`@milo <feedback>` on any open `acarr/milo` PR (or add the `milo` label) and Milo will revise
-that PR — including PRs for its own code. If the PR's branch is checked out in your dev tree, Milo
-attaches a detached worktree at the PR head and pushes by refspec, so your checkout is never touched.
+GitHub `@milo` attach is **disabled on the public `acarr/milo` repo** — it has no `githubRepo` in
+config, so it isn't GitHub-polled (a public repo would otherwise let anyone trigger a local run). Drive
+milo's own work through Linear `MILO` tickets or `milo <ID>`. For a **private** repo with a `githubRepo`
+set, commenting `@milo <feedback>` on an open PR (or adding the `milo` label) makes Milo revise that PR.
+If the PR's branch is checked out in your dev tree, Milo attaches a detached worktree at the PR head and
+pushes by refspec, so your checkout is never touched.
 
 Only **one** process drains the queue. `milo <ID>` defers to a running daemon (enqueue-only); if no
 daemon is up it drains inline.

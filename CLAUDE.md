@@ -86,9 +86,11 @@ reliability, scheduling, webhooks, database, operations); remaining optional wor
   `ensurePushed` pushes by refspec (`HEAD:<branch>`) — Milo can revise a PR without touching the
   developer's checkout. Deterministic worktree failures (`isPermanentWorktreeError`) are classified
   `logic` → straight to `needs-attention`, never `transient-infra` retries, never breaker accounting.
-- ✅ **MILO-9** — **dogfooding enabled**: the `milo` repo entry in `~/.milo/config.json` has
-  `githubRepo: "acarr/milo"`, so `@milo` PR comments / `milo` labels on milo PRs trigger
-  attach mode (verified live — see the ticket).
+- ✅ **MILO-9** — **dogfooding**: the GitHub `@milo`/label attach loop was proven on the `milo` repo,
+  but it's **intentionally disabled on the public repo** (the `milo` entry has no `githubRepo`, so it
+  isn't GitHub-polled) — a public repo + empty `trust.githubActors` would let anyone trigger a local
+  run. Milo still dogfoods its own work via Linear `MILO` tickets + the `milo <ID>` CLI; the attach
+  pattern stays available for private repos (e.g. the sandbox).
 - ✅ **MILO-2** — **`milo init` onboarding wizard** (revamped after first-use feedback): quiet
   tool-only pre-check (claude blocks, gh offers login; no doctor wall-of-checks — path checks wait
   for the final doctor) → Ink wizard (`packages/cli/src/init/`): ASCII-cat welcome → paths
@@ -171,9 +173,11 @@ tokens currently live in `config.json` (moving to a `secrets/` file is deferred)
   app:mentionable; redirect `localhost:8989`). Client id/secret + token in `config.json`.
 - **Sandbox**: repo `your-org/milo-sandbox` at `~/development/milo-sandbox` (a Hono task API),
   Linear team **Milo Sandbox**, key **SBX**. Use it for live tests (create a ticket, `milo SBX-N`).
-- **Dogfooding (MILO-9)**: the `milo` repo itself is wired for GitHub attach mode
-  (`githubRepo: "acarr/milo"` in config) — a `@milo <feedback>` comment or a `milo` label on
-  an open `acarr/milo` PR makes Milo revise that PR. `trust.githubActors` is empty (no gate).
+- **Dogfooding (MILO-9)**: GitHub `@milo` attach is **disabled on the public `acarr/milo` repo** (the
+  `milo` entry has no `githubRepo`, so it isn't GitHub-polled) — a public repo + empty
+  `trust.githubActors` would let anyone trigger a local run (incl. running an untrusted PR's setup
+  scripts). Drive milo work via Linear `MILO` tickets / `milo <ID>` instead. Private repos
+  (e.g. `your-org/milo-sandbox`) still use `@milo` attach.
 
 ## Commands
 
