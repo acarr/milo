@@ -117,6 +117,19 @@ reliability, scheduling, webhooks, database, operations); remaining optional wor
   failure: `claude -p` finished but MCP-server children kept it alive 4.5h), **inactivity** (~20 min),
   **wall-clock cap** (~3h). A guard kill takes out the whole tree; a post-result kill still counts as
   success (the verification gate re-derives ground truth regardless). Closes REMAINING-WORK B2.
+- ✅ **CLI/TUI redesign** — operate Milo around list → drill-in → watch → act. A shared CLI
+  **view-model client** (`packages/cli/src/viewmodel.ts`) backs both the plain commands and a rebuilt
+  **k9s-style Ink TUI** (`ui.tsx` view-stack App + `views/*` + a shared `components/` library the two
+  setup wizards now share too). **Per-job transcripts**: the normalized RunnerEvent stream is teed to a
+  redacted `$MILO_HOME/logs/<jobId>.events.jsonl` in all four pipeline paths (`transcript.ts`;
+  `redactSecrets` factored out of `progress.ts`), surfaced via the TUI transcript view + `milo watch`.
+  **Actions**: `rerun` (clone → new job, dedup-safe via a `:rerun:<ulid>` content-hash), `retry`
+  (reset a failed row in place), `cancel` (new terminal `cancelled` state + `cancel_requested` columns;
+  an `AbortSignal` threaded through both runners → `killTree`; the pipeline polls the flag ~2s, kills,
+  **skips the verification gate**, and tears down). **In-TUI config**: Repos view (list/remove) +
+  Settings view (webhook/runner/auto-merge/concurrency, bidirectional `updateSettings`). New columns
+  `events_log`/`runner_log`/`cancel_requested`(`_at`) via idempotent migration (schema_version→4). New
+  commands: `job`, `watch`, `rerun`, `retry`, `cancel`, `repos`, `remove-repo`.
 - ⏳ **Follow-up (remaining)** — clarifying-questions/await-input loop in Linear (MILO-8); focused-runner
   remediation cycle before the direct-PR fallback; cross-repo (fork) attach support (MILO-10);
   sub-10s agent-session ack via webhooks; merge the SBX test PRs #5–#7; stream progress to GitHub PR
@@ -186,17 +199,25 @@ milo <ID> [<ID>...]   # enqueue issues (daemon runs them, else inline). e.g. mil
 milo poll             # one-shot Linear+GitHub poll → enqueue any new work
 milo schedules [--json] # list scheduled automations (next/last run)
 milo prompt <name>    # run a scheduled prompt now (from <repo>/.milo/schedules.json). e.g. milo prompt milo:nightly-tidy
-milo jobs [--json]    # list jobs from the store
+milo jobs [--json]    # list jobs (filters: --state <s> --repo <r> --search <q>)
+milo job <jobId>      # full detail for one job (events, deps, PR, failure)
+milo watch <ID|jobId> # stream a job's live transcript (replay + tail); --json = raw JSONL
+milo rerun <ID|jobId> # re-run a job from scratch as a new job
+milo retry <ID|jobId> # re-queue a failed/needs-attention job in place
+milo cancel <ID|jobId> # cancel a queued/in-flight job (kills the runner)
 milo status [--json]  # daemon liveness + queue counts
-milo logs <ID>        # latest runner log for an issue
+milo logs <ID>        # latest RAW runner log for an issue (watch = normalized transcript)
 milo daemon           # always-on worker: queue + pollers + scheduler (or launchd: scripts/install-launchd.sh)
 milo restart [--force] # restart the daemon (picks up new code; launchd-aware). milo stop = stop it
 
-milo                  # interactive Ink TUI (bare); milo ui is the same
-milo doctor [--json]  # environment checks
+milo                  # interactive Ink TUI (bare); milo ui is the same. 1-5 switch views (jobs/
+                      #   schedules/system/repos/settings); ⏎ detail, t transcript, r/R/x rerun/retry/cancel
+milo doctor [--json]  # environment checks (also the TUI System view: key 3 → d)
 milo init             # guided onboarding: env check → paths → Linear → opt-ins → first repo → doctor
 milo linear-auth      # (re)register the Linear agent
 milo add-repo [path]  # wire a git repo into config.json (infers details, maps Linear teams via TUI)
+milo repos [--json]   # list configured repos (TUI Repos view: key 4; remove with d)
+milo remove-repo <name> # remove a repo from config.json
 ```
 `milo` is on PATH via `~/.local/bin/milo` → `bin/milo.mjs` (tsx). The old `~/.zshrc` alias was repointed;
 the bash `milo.sh`/`teardown.sh` are retired.
