@@ -1,6 +1,7 @@
 import type { MiloConfig, RepoConfig } from "./config.js";
 import { resolveRepo, resolveRepoByName, resolveProgress } from "./config.js";
 import { ProgressStreamer } from "./progress.js";
+import { makeEventFileSink, eventsLogPath } from "./transcript.js";
 import type { RunnerEventSink } from "./runner-events.js";
 import type { JobStore, Job } from "./jobs.js";
 import { LinearClient, type LinearIssue } from "./linear.js";
@@ -25,6 +26,8 @@ export interface RunnerFn {
     echo?: NodeJS.WritableStream;
     /** Optional progress sink — runners that emit structured events call this as they work. */
     onEvent?: RunnerEventSink;
+    /** Abort the run (user-initiated cancel) — the runner kills its whole process group. */
+    signal?: AbortSignal;
   }): Promise<{ code: number; output: string; logFile: string }>;
 }
 
@@ -58,6 +61,21 @@ function routingInstruction(repo: RepoConfig, issue: LinearIssue): string {
 function logFilePath(ref: string): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return join(logsDir(), `${ref.replace(/[^A-Za-z0-9._-]/g, "_")}-${stamp}.log`);
+}
+
+/**
+ * Tee a runner's event stream into (1) a per-job transcript file — always, so the TUI / `milo watch`
+ * can show a live, replayable transcript even for label-only and scheduled jobs — and (2) the Linear
+ * `ProgressStreamer`, when one exists (delegated jobs only). The file sink is best-effort and never
+ * throws; `close()` flushes it after the run.
+ */
+function buildSinks(jobId: string, progress?: ProgressStreamer): { onEvent: RunnerEventSink; close: () => void } {
+  const file = makeEventFileSink(jobId);
+  const onEvent: RunnerEventSink = (e) => {
+    file.sink(e);
+    progress?.handle(e);
+  };
+  return { onEvent, close: file.close };
 }
 
 /** Build the function that processes a single claimed job through its full lifecycle. */
@@ -166,6 +184,53 @@ export function makeProcessJob(deps: PipelineDeps) {
     }
   }
 
+  /**
+   * Run the agent with cooperative cancellation. Polls the job's cancel flag (~2s — far finer than
+   * the 30s heartbeat) and aborts the runner's process group when it flips. Returns whether the run
+   * was cancelled so the caller can skip the verification gate (a cancel means "don't ship half-done
+   * work"). The lease-owning worker is the only thing that kills + finalizes, so there's no race
+   * with the watchdog or the CLI/TUI (which only set the flag).
+   */
+  async function runWithCancel(
+    job: Job,
+    opts: Omit<Parameters<RunnerFn>[0], "signal">,
+    runner: RunnerFn,
+  ): Promise<{ run: Awaited<ReturnType<RunnerFn>>; cancelled: boolean }> {
+    const ctrl = new AbortController();
+    if (store.isCancelRequested(job.id)) ctrl.abort(); // requested during setup → abort before any work
+    const iv = setInterval(() => {
+      try {
+        if (store.isCancelRequested(job.id)) ctrl.abort();
+      } catch {
+        /* ignore transient db contention */
+      }
+    }, 2_000);
+    if (typeof iv.unref === "function") iv.unref();
+    try {
+      const run = await runner({ ...opts, signal: ctrl.signal });
+      return { run, cancelled: ctrl.signal.aborted };
+    } finally {
+      clearInterval(iv);
+    }
+  }
+
+  /** Finalize a cancelled run: notify (best-effort), mark `cancelled`, and discard the worktree. */
+  async function finalizeCancelled(
+    job: Job,
+    repo: RepoConfig,
+    worktreePath: string,
+    notify?: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await notify?.();
+    } catch {
+      /* best-effort */
+    }
+    store.transition(job.id, "cancelled", { failure_class: "cancelled", failure_detail: "cancelled by user" });
+    teardownIfNeeded(repo, worktreePath, false, true); // force-discard the half-done worktree
+    logger.info({ jobId: job.id }, "job cancelled by user");
+  }
+
   // ---------------------------------------------------------------- Linear (create mode)
 
   async function processLinearJob(job: Job): Promise<void> {
@@ -227,12 +292,15 @@ export function makeProcessJob(deps: PipelineDeps) {
       });
       return;
     }
+    const logFile = logFilePath(ref);
     store.transition(job.id, "running", {
       worktree_path: worktree.path,
       branch: worktree.branch,
       base_branch: worktree.baseBranch,
       runner: runnerId,
       model,
+      events_log: eventsLogPath(job.id),
+      runner_log: logFile,
     });
 
     // Best-effort In Progress.
@@ -246,7 +314,6 @@ export function makeProcessJob(deps: PipelineDeps) {
 
     const augment = [config.promptAugmentation.global, repo.promptAugmentation].filter(Boolean).join("\n\n");
     const prompt = buildPrompt({ repo, worktree, issue, routingInstruction: routingInstruction(repo, issue) });
-    const logFile = logFilePath(ref);
     store.heartbeat(job.id);
 
     // Phase C: only stream live progress when the issue was delegated to the agent (has a session).
@@ -263,17 +330,29 @@ export function makeProcessJob(deps: PipelineDeps) {
           )
         : undefined;
 
-    const run = await runner({
-      cwd: worktree.path,
-      prompt,
-      model,
-      appendSystemPrompt: augment || undefined,
-      logFile,
-      echo,
-      onEvent: progress ? (e) => progress.handle(e) : undefined,
-    });
+    const sinks = buildSinks(job.id, progress);
+    const { run, cancelled } = await runWithCancel(
+      job,
+      {
+        cwd: worktree.path,
+        prompt,
+        model,
+        appendSystemPrompt: augment || undefined,
+        logFile,
+        echo,
+        onEvent: sinks.onEvent,
+      },
+      runner,
+    );
+    sinks.close();
     // Flush any buffered progress and stop before the terminal response so it always lands last.
     await progress?.stop();
+    if (cancelled) {
+      await finalizeCancelled(job, repo, worktree.path, async () => {
+        if (sessionId) await linear.agentError(sessionId, "Milo cancelled this run.");
+      });
+      return;
+    }
     const result = parseResult(run.output);
 
     // ---- Verification gate (never trust the self-report) ----
@@ -392,12 +471,15 @@ export function makeProcessJob(deps: PipelineDeps) {
       });
       return;
     }
+    const logFile = logFilePath(ref);
     store.transition(job.id, "running", {
       worktree_path: worktree.path,
       branch: worktree.branch,
       base_branch: worktree.baseBranch,
       runner: runnerId,
       model,
+      events_log: eventsLogPath(job.id),
+      runner_log: logFile,
     });
     thought(`Picked up your follow-up — revising the existing branch \`${worktree.branch}\` (PR ${prior.prUrl}).`);
 
@@ -408,10 +490,21 @@ export function makeProcessJob(deps: PipelineDeps) {
 
     const augment = [config.promptAugmentation.global, repo.promptAugmentation].filter(Boolean).join("\n\n");
     const prompt = buildLinearAttachPrompt({ repo, worktree, issue, prUrl: prior.prUrl, instruction });
-    const logFile = logFilePath(ref);
     store.heartbeat(job.id);
 
-    const run = await runner({ cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo });
+    const sinks = buildSinks(job.id);
+    const { run, cancelled } = await runWithCancel(
+      job,
+      { cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent },
+      runner,
+    );
+    sinks.close();
+    if (cancelled) {
+      await finalizeCancelled(job, repo, worktree.path, async () => {
+        if (sessionId) await linear.agentError(sessionId, "Milo cancelled this revision.");
+      });
+      return;
+    }
     const result = parseResult(run.output);
 
     store.transition(job.id, "verifying", {
@@ -518,20 +611,32 @@ export function makeProcessJob(deps: PipelineDeps) {
       await failWorktreeSetup(job, repo.name, err as Error, async (msg) => void addPrComment(slug, number, msg));
       return;
     }
+    const logFile = logFilePath(ref);
     store.transition(job.id, "running", {
       worktree_path: worktree.path,
       branch: worktree.branch,
       base_branch: worktree.baseBranch,
       runner: runnerId,
       model,
+      events_log: eventsLogPath(job.id),
+      runner_log: logFile,
     });
 
     const augment = [config.promptAugmentation.global, repo.promptAugmentation].filter(Boolean).join("\n\n");
     const prompt = buildAttachPrompt({ repo, worktree, pr, instruction });
-    const logFile = logFilePath(ref);
     store.heartbeat(job.id);
 
-    const run = await runner({ cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo });
+    const sinks = buildSinks(job.id);
+    const { run, cancelled } = await runWithCancel(
+      job,
+      { cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent },
+      runner,
+    );
+    sinks.close();
+    if (cancelled) {
+      await finalizeCancelled(job, repo, worktree.path, async () => void addPrComment(slug, number, "Milo cancelled this run."));
+      return;
+    }
     const result = parseResult(run.output);
 
     store.transition(job.id, "verifying", {
@@ -620,20 +725,32 @@ export function makeProcessJob(deps: PipelineDeps) {
       await failWorktreeSetup(job, repo.name, err as Error);
       return;
     }
+    const logFile = logFilePath(ref);
     store.transition(job.id, "running", {
       worktree_path: worktree.path,
       branch: worktree.branch,
       base_branch: worktree.baseBranch,
       runner: runnerId,
       model,
+      events_log: eventsLogPath(job.id),
+      runner_log: logFile,
     });
 
     const augment = [config.promptAugmentation.global, repo.promptAugmentation].filter(Boolean).join("\n\n");
     const prompt = buildFreeformPrompt({ repo, worktree, instruction: job.customPrompt ?? "" });
-    const logFile = logFilePath(ref);
     store.heartbeat(job.id);
 
-    const run = await runner({ cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo });
+    const sinks = buildSinks(job.id);
+    const { run, cancelled } = await runWithCancel(
+      job,
+      { cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent },
+      runner,
+    );
+    sinks.close();
+    if (cancelled) {
+      await finalizeCancelled(job, repo, worktree.path); // no external thread to notify
+      return;
+    }
     const result = parseResult(run.output);
 
     store.transition(job.id, "verifying", {

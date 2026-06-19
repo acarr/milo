@@ -14,6 +14,7 @@ export * from "./router.js";
 export * from "./pipeline.js";
 export * from "./runner-events.js";
 export * from "./progress.js";
+export * from "./transcript.js";
 export * from "./scheduler.js";
 export * from "./repo-schedules.js";
 export * from "./maintenance.js";

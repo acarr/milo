@@ -50,6 +50,35 @@ export function killTree(pid: number | undefined, signal: NodeJS.Signals = "SIGT
   }
 }
 
+/**
+ * Wire an `AbortSignal` to kill a detached child's whole process group — the mechanism behind
+ * user-initiated cancel. SIGTERM first, then SIGKILL after a grace window for a tree that ignores
+ * it. Returns a disposer that removes the listener (call it when the run exits on its own).
+ */
+export function onAbortKill(
+  signal: AbortSignal | undefined,
+  pid: number | undefined,
+  onFire?: () => void,
+): () => void {
+  if (!signal) return () => {};
+  const fire = () => {
+    try {
+      onFire?.();
+    } catch {
+      /* a notifier must never break the kill path */
+    }
+    killTree(pid, "SIGTERM");
+    const escalate = setTimeout(() => killTree(pid, "SIGKILL"), 10_000);
+    escalate.unref();
+  };
+  if (signal.aborted) {
+    fire();
+    return () => {};
+  }
+  signal.addEventListener("abort", fire, { once: true });
+  return () => signal.removeEventListener("abort", fire);
+}
+
 export class RunGuards {
   private inactivity?: NodeJS.Timeout;
   private wallClock?: NodeJS.Timeout;

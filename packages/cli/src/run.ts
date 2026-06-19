@@ -15,8 +15,11 @@ import {
   logsDir,
   syncDependencies,
   reconcileDependencies,
+  TERMINAL_STATES,
+  type PersistedEvent,
 } from "@milo/core";
 import { runClaude, runCodex, parseRunnerResult } from "@milo/runners";
+import { createClient, type JobsFilter } from "./viewmodel.js";
 
 /**
  * Enqueue one or more Linear issues and drain the queue with managed concurrency.
@@ -116,28 +119,32 @@ const STATE_COLOR: Record<string, string> = {
   failed: "\x1b[31m",
   "needs-attention": "\x1b[31m",
   abandoned: "\x1b[31m",
+  cancelled: "\x1b[90m",
   running: "\x1b[36m",
   queued: "\x1b[33m",
 };
 const RESET = "\x1b[0m";
 
+const STATE_ORDER = [
+  "queued", "claimed", "setting-up", "running", "verifying", "remediating", "reporting",
+  "done", "discovery-done", "retrying", "failed", "needs-attention", "cancelled", "abandoned",
+];
+
 /** `milo status [--json]` — daemon liveness + queue counts. */
 export function status(json: boolean): number {
-  const db = openDatabase();
-  const store = new JobStore(db);
-  const counts = store.countByState();
-  const daemon = readDaemon();
-  const running = isDaemonRunning();
-  db.close();
+  const client = createClient();
+  const d = client.daemon();
+  client.close();
   if (json) {
-    process.stdout.write(JSON.stringify({ daemon: { running, ...daemon }, jobs: counts }, null, 2) + "\n");
+    process.stdout.write(
+      JSON.stringify({ daemon: { running: d.running, pid: d.pid, startedAt: d.startedAt }, jobs: d.counts }, null, 2) + "\n",
+    );
     return 0;
   }
-  console.log(`daemon:  ${running ? `\x1b[32mrunning\x1b[0m (pid ${daemon?.pid})` : "\x1b[33mnot running\x1b[0m"}`);
-  const order = ["queued", "claimed", "setting-up", "running", "verifying", "remediating", "reporting", "done", "discovery-done", "retrying", "failed", "needs-attention", "abandoned"];
-  const parts = order.filter((s) => counts[s]).map((s) => `${s}=${counts[s]}`);
+  console.log(`daemon:  ${d.running ? `\x1b[32mrunning\x1b[0m (pid ${d.pid})` : "\x1b[33mnot running\x1b[0m"}`);
+  const parts = STATE_ORDER.filter((s) => d.counts[s]).map((s) => `${s}=${d.counts[s]}`);
   console.log(`jobs:    ${parts.length ? parts.join("  ") : "none"}`);
-  if (!running) console.log(`\nStart it with:  milo daemon   (or install the launchd agent — see scripts/install-launchd.sh)`);
+  if (!d.running) console.log(`\nStart it with:  milo daemon   (or install the launchd agent — see scripts/install-launchd.sh)`);
   return 0;
 }
 
@@ -291,24 +298,133 @@ export function tailLog(issueId: string): number {
   return 0;
 }
 
+const KIND_TAG: Record<string, string> = { "file-change": "±", tool: "›", notice: "!", narration: "·" };
+
+function renderEvent(e: PersistedEvent, json: boolean): void {
+  if (json) {
+    process.stdout.write(JSON.stringify(e) + "\n");
+    return;
+  }
+  const color =
+    e.kind === "file-change" ? "\x1b[32m" : e.kind === "tool" ? "\x1b[36m" : e.kind === "notice" ? "\x1b[33m" : "\x1b[2m";
+  const label = e.tool ? `${e.tool}: ` : "";
+  console.log(`${color}${KIND_TAG[e.kind] ?? "·"}${RESET} ${label}${e.text}`);
+}
+
+/**
+ * `milo watch <ID|jobId> [--json]` — stream a job's normalized transcript to the terminal (the
+ * narration/tool/file-change events as the agent works), replaying what already happened and then
+ * tailing live until the job finishes. The redacted, UI-safe complement to `milo logs` (raw).
+ */
+export async function watchJob(ref: string, json: boolean): Promise<number> {
+  const client = createClient();
+  const job = client.resolveJob(ref);
+  if (!job) {
+    console.error(`No job for ${ref}.`);
+    client.close();
+    return 1;
+  }
+  const isTerminal = (s: string) => (TERMINAL_STATES as string[]).includes(s);
+
+  if (isTerminal(job.state)) {
+    // Already finished — replay the whole transcript and exit.
+    for (const e of client.readTranscript(job.id)) renderEvent(e, json);
+    if (!json) console.log(`\n[milo] ${job.state}  ${job.prUrl ?? job.failureDetail ?? ""}`);
+    client.close();
+    return 0;
+  }
+
+  if (!json) console.log(`[milo] watching ${job.id} (${job.entityRef ?? job.entityId}) — ${job.state} · Ctrl-C to stop\n`);
+  const unsubscribe = client.tailTranscript(job.id, (e) => renderEvent(e, json));
+  await new Promise<void>((resolve) => {
+    const iv = setInterval(() => {
+      const j = client.store.get(job.id);
+      if (!j || isTerminal(j.state)) {
+        clearInterval(iv);
+        resolve();
+      }
+    }, 1000);
+  });
+  await new Promise((r) => setTimeout(r, 400)); // let the tail flush its final events
+  unsubscribe();
+  const final = client.store.get(job.id);
+  if (!json) console.log(`\n[milo] ${final?.state}  ${final?.prUrl ?? final?.failureDetail ?? ""}`);
+  client.close();
+  return 0;
+}
+
+/**
+ * `milo rerun <ID|jobId>` — re-run a job from scratch as a new job. For a Linear/GitHub entity that
+ * already shipped a PR this revises that PR (never a duplicate). Enqueue-only: the daemon runs it.
+ */
+export function rerunJob(ref: string): number {
+  const client = createClient();
+  const target = client.resolveJob(ref);
+  if (!target) {
+    console.error(`No job for ${ref}.`);
+    client.close();
+    return 1;
+  }
+  const res = client.rerun(target.id);
+  const daemonUp = client.daemon().running;
+  client.close();
+  if (!res.ok) {
+    console.error(`[milo] ${res.error}`);
+    return 1;
+  }
+  console.log(`[milo] re-running ${target.entityRef ?? target.entityId} as job ${res.value.id} (queued).`);
+  if (daemonUp) console.log(`[milo] daemon will process it. Watch: milo watch ${res.value.id}`);
+  else console.log(`[milo] no daemon running — start it (milo daemon) to process it.`);
+  return 0;
+}
+
+/** `milo retry <ID|jobId>` — re-queue a failed / needs-attention / abandoned job in place. */
+export function retryJob(ref: string): number {
+  const client = createClient();
+  const target = client.resolveJob(ref);
+  if (!target) {
+    console.error(`No job for ${ref}.`);
+    client.close();
+    return 1;
+  }
+  const res = client.retry(target.id);
+  const daemonUp = client.daemon().running;
+  client.close();
+  if (!res.ok) {
+    console.error(`[milo] ${res.error}`);
+    return 1;
+  }
+  console.log(`[milo] re-queued job ${res.value.id} (${target.entityRef ?? target.entityId}).`);
+  if (daemonUp) console.log(`[milo] daemon will process it. Watch: milo watch ${res.value.id}`);
+  else console.log(`[milo] no daemon running — start it (milo daemon) to process it.`);
+  return 0;
+}
+
+/** `milo cancel <ID|jobId>` — cancel a queued or in-flight job (kills the runner if it's running). */
+export function cancelJob(ref: string): number {
+  const client = createClient();
+  const target = client.resolveJob(ref);
+  if (!target) {
+    console.error(`No job for ${ref}.`);
+    client.close();
+    return 1;
+  }
+  const res = client.cancel(target.id);
+  client.close();
+  if (!res.ok) {
+    console.error(`[milo] ${res.error}`);
+    return 1;
+  }
+  if (res.value === "cancelled") console.log(`[milo] cancelled ${target.entityRef ?? target.entityId} (job ${target.id}).`);
+  else console.log(`[milo] cancellation requested for job ${target.id} — the worker will stop it shortly.`);
+  return 0;
+}
+
 /** `milo schedules [--json]` — list configured schedules with next/last run times. */
 export async function listSchedules(json: boolean): Promise<number> {
-  const { config } = loadConfig();
-  const db = openDatabase();
-  const store = new JobStore(db);
-  const { effectiveSchedules } = await import("@milo/daemon");
-  const { Scheduler } = await import("@milo/core");
-  const defs = effectiveSchedules(config);
-  const rows = defs.map((d) => ({
-    name: d.name,
-    cron: d.cron,
-    kind: (d.intent?.["kind"] as string) ?? "prompt",
-    enabled: d.enabled,
-    nextRun: d.enabled ? Scheduler.nextRun(d.cron) : null,
-    lastRun: store.lastScheduleRun(d.name) ?? null,
-  }));
-  const recent = store.listScheduleRuns(10);
-  db.close();
+  const client = createClient();
+  const { rows, recent } = await client.schedules();
+  client.close();
   if (json) {
     process.stdout.write(JSON.stringify({ schedules: rows, recent }, null, 2) + "\n");
     return 0;
@@ -422,28 +538,81 @@ export async function pollNow(json: boolean): Promise<number> {
   return 0;
 }
 
-/** `milo jobs [--json]` — list jobs from the store. */
-export function listJobs(json: boolean): number {
-  const db = openDatabase();
-  const store = new JobStore(db);
-  const jobs = store.list({ limit: 100 });
+/** Truncate to `n` chars with an ellipsis, for fixed-width table cells. */
+function fit(s: string, n: number): string {
+  const oneLine = s.replace(/\s+/g, " ").trim();
+  return oneLine.length <= n ? oneLine : oneLine.slice(0, n - 1) + "…";
+}
+
+function ageStr(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+/** `milo jobs [--json] [--state <s>] [--repo <r>] [--search <q>]` — list jobs from the store. */
+export function listJobs(json: boolean, filter: JobsFilter = {}): number {
+  const client = createClient();
+  const rows = client.jobs({ limit: 100, ...filter });
+  client.close();
   if (json) {
-    process.stdout.write(JSON.stringify(jobs, null, 2) + "\n");
-    db.close();
+    process.stdout.write(JSON.stringify(rows, null, 2) + "\n");
     return 0;
   }
-  if (jobs.length === 0) {
-    console.log("No jobs yet.");
-    db.close();
+  if (rows.length === 0) {
+    console.log(Object.keys(filter).length ? "No jobs match that filter." : "No jobs yet.");
     return 0;
   }
-  console.log(`${"ISSUE".padEnd(10)}${"STATE".padEnd(16)}${"RUNNER".padEnd(8)}PR / DETAIL`);
-  for (const j of jobs) {
-    const color = STATE_COLOR[j.state] ?? "";
+  console.log(`${"ID".padEnd(8)}${"ISSUE".padEnd(22)}${"STATE".padEnd(16)}${"RUNNER".padEnd(8)}${"AGE".padEnd(6)}PR / DETAIL`);
+  for (const r of rows) {
+    const color = STATE_COLOR[r.state] ?? "";
     console.log(
-      `${(j.entityRef ?? j.entityId).padEnd(10)}${color}${j.state.padEnd(16)}${RESET}${(j.runner ?? "-").padEnd(8)}${j.prUrl ?? j.failureDetail ?? ""}`,
+      `${r.id.slice(-6).padEnd(8)}${fit(r.ref, 21).padEnd(22)}${color}${r.state.padEnd(16)}${RESET}${(r.runner ?? "-").padEnd(8)}${ageStr(r.ageMs).padEnd(6)}${fit(r.detail ?? "", 80)}`,
     );
   }
-  db.close();
+  return 0;
+}
+
+/** `milo job <jobId> [--json]` — full detail for a single job (events, dependencies, PR, failure). */
+export function showJob(jobId: string, json: boolean): number {
+  const client = createClient();
+  const detail = client.job(jobId) ?? (() => {
+    const j = client.resolveJob(jobId);
+    return j ? client.job(j.id) : undefined;
+  })();
+  client.close();
+  if (!detail) {
+    console.error(`No job ${jobId}.`);
+    return 1;
+  }
+  if (json) {
+    process.stdout.write(JSON.stringify(detail, null, 2) + "\n");
+    return 0;
+  }
+  const { job, events, dependencies } = detail;
+  const color = STATE_COLOR[job.state] ?? "";
+  console.log(`${job.id}  ${color}${job.state}${RESET}`);
+  console.log(`  entity:   ${job.entityRef ?? job.entityId}  (${job.source}/${job.triggerType})`);
+  console.log(`  repo:     ${job.repo}${job.branch ? `  branch ${job.branch}` : ""}`);
+  console.log(`  runner:   ${job.runner ?? "-"}${job.model ? ` (${job.model})` : ""}  attempts ${job.attempts}/${job.maxAttempts}`);
+  if (job.prUrl) console.log(`  pr:       ${job.prUrl}`);
+  if (job.summary) console.log(`  summary:  ${job.summary}`);
+  if (job.failureDetail) console.log(`  failure:  ${job.failureClass ?? ""} ${job.failureDetail}`);
+  if (dependencies.length) {
+    console.log(`  blockedBy:`);
+    for (const d of dependencies) console.log(`    ${d.blockerEntityId}  ${d.strategy}  ${d.resolved ? "resolved" : "pending"}`);
+  }
+  if (events.length) {
+    console.log(`  events:`);
+    for (const e of events) {
+      const when = new Date(e.at).toLocaleTimeString();
+      const transition = e.from || e.to ? `  ${e.from ?? "—"}→${e.to ?? "—"}` : "";
+      console.log(`    ${when}  ${e.kind}${transition}`);
+    }
+  }
   return 0;
 }

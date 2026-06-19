@@ -137,10 +137,17 @@ export function openDatabase(path = dbPath()): DB {
   const jobCols = new Set((db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]).map((c) => c.name));
   if (!jobCols.has("custom_prompt")) db.exec("ALTER TABLE jobs ADD COLUMN custom_prompt TEXT");
   if (!jobCols.has("next_eligible_at")) db.exec("ALTER TABLE jobs ADD COLUMN next_eligible_at INTEGER");
+  // v3: per-job transcript + raw runner log paths (recorded when a job reaches `running`).
+  if (!jobCols.has("events_log")) db.exec("ALTER TABLE jobs ADD COLUMN events_log TEXT");
+  if (!jobCols.has("runner_log")) db.exec("ALTER TABLE jobs ADD COLUMN runner_log TEXT");
+  // v4: user-initiated cancel — an out-of-band flag the running worker polls (not a state, which
+  // would race the pipeline's own running→verifying→… transitions).
+  if (!jobCols.has("cancel_requested")) db.exec("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
+  if (!jobCols.has("cancel_requested_at")) db.exec("ALTER TABLE jobs ADD COLUMN cancel_requested_at INTEGER");
   // Created here (not in SCHEMA) so the next_eligible_at column exists first on migrated databases.
   db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_eligible ON jobs(state, next_eligible_at)");
   db.prepare(
-    "INSERT INTO schema_meta(key, value) VALUES('schema_version', '2') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    "INSERT INTO schema_meta(key, value) VALUES('schema_version', '4') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
   ).run();
   return db;
 }

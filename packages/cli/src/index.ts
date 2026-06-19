@@ -2,7 +2,8 @@
 import { existsSync } from "node:fs";
 import { configPath } from "@milo/core";
 import { runDoctor, printDoctor } from "./doctor.js";
-import { runIssues, runPrompt, listJobs, status, tailLog, pollNow, listSchedules, restartDaemon, stopDaemon } from "./run.js";
+import { runIssues, runPrompt, listJobs, showJob, watchJob, rerunJob, retryJob, cancelJob, status, tailLog, pollNow, listSchedules, restartDaemon, stopDaemon } from "./run.js";
+import type { JobsFilter, StateFilter } from "./viewmodel.js";
 import { linearAuth } from "./linear-auth.js";
 
 const HELP = `milo — local autonomous coding agent
@@ -14,9 +15,14 @@ Usage:
   milo init [--sandbox]   guided setup: environment check, Linear, first repo
                           (--sandbox: full dry run — no daemon install or shell-profile writes)
   milo add-repo [path]    wire a git repo into Milo (infers details, maps Linear teams)
-  milo jobs [--json]      list jobs and their state
+  milo jobs [--json]      list jobs (filters: --state <s> --repo <r> --search <q>)
+  milo job <jobId>        full detail for one job (events, deps, PR, failure)
   milo status [--json]    daemon liveness + queue counts
-  milo logs <id>          print the latest runner log for an issue
+  milo logs <id>          print the latest raw runner log for an issue
+  milo watch <id> [--json] stream a job's live transcript (replay + tail)
+  milo rerun <id>         re-run a job from scratch as a new job
+  milo retry <id>         re-queue a failed/needs-attention job in place
+  milo cancel <id>        cancel a queued or in-flight job (kills the runner)
   milo daemon             run the always-on worker (usually launched by launchd)
   milo restart [--force]  restart the daemon (picks up new code; --force skips graceful drain)
   milo stop [--force]     stop the daemon (graceful; --force SIGKILLs)
@@ -27,6 +33,12 @@ Usage:
   milo linear-auth        register Milo as a Linear agent (OAuth actor=app)
   milo --help             show this help
 `;
+
+/** Read the value of a `--flag value` pair from argv (returns undefined if absent or trailing). */
+function flagValue(args: string[], name: string): string | undefined {
+  const i = args.indexOf(name);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+}
 
 async function main(argv: string[]): Promise<number> {
   const args = argv.slice(2);
@@ -67,8 +79,24 @@ async function main(argv: string[]): Promise<number> {
       const { runAddRepo } = await import("./repo-setup/index.js");
       return runAddRepo(args.slice(1));
     }
-    case "jobs":
-      return listJobs(json);
+    case "jobs": {
+      const filter: JobsFilter = {};
+      const state = flagValue(args, "--state");
+      if (state) filter.state = state as StateFilter;
+      const repo = flagValue(args, "--repo");
+      if (repo) filter.repo = repo;
+      const search = flagValue(args, "--search");
+      if (search) filter.search = search;
+      return listJobs(json, filter);
+    }
+    case "job": {
+      const id = args[1];
+      if (!id) {
+        console.error("usage: milo job <jobId>");
+        return 1;
+      }
+      return showJob(id, json);
+    }
     case "status":
       return status(json);
     case "logs": {
@@ -78,6 +106,38 @@ async function main(argv: string[]): Promise<number> {
         return 1;
       }
       return tailLog(id);
+    }
+    case "watch": {
+      const id = args[1];
+      if (!id) {
+        console.error("usage: milo watch <ISSUE-ID | jobId>");
+        return 1;
+      }
+      return watchJob(id, json);
+    }
+    case "rerun": {
+      const id = args[1];
+      if (!id) {
+        console.error("usage: milo rerun <ISSUE-ID | jobId>");
+        return 1;
+      }
+      return rerunJob(id);
+    }
+    case "retry": {
+      const id = args[1];
+      if (!id) {
+        console.error("usage: milo retry <ISSUE-ID | jobId>");
+        return 1;
+      }
+      return retryJob(id);
+    }
+    case "cancel": {
+      const id = args[1];
+      if (!id) {
+        console.error("usage: milo cancel <ISSUE-ID | jobId>");
+        return 1;
+      }
+      return cancelJob(id);
     }
     case "daemon": {
       const { startDaemon } = await import("@milo/daemon");

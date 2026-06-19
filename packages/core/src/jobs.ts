@@ -15,6 +15,7 @@ export type JobState =
   | "retrying"
   | "failed"
   | "needs-attention"
+  | "cancelled"
   | "abandoned";
 
 export const TERMINAL_STATES: JobState[] = [
@@ -22,6 +23,7 @@ export const TERMINAL_STATES: JobState[] = [
   "discovery-done",
   "failed",
   "needs-attention",
+  "cancelled",
   "abandoned",
 ];
 
@@ -97,6 +99,13 @@ export interface Job {
   failureClass: string | null;
   failureDetail: string | null;
   summary: string | null;
+  /** Path to the per-job normalized transcript (`<jobId>.events.jsonl`), set at `running`. */
+  eventsLog: string | null;
+  /** Path to the raw runner stream-json log, set at `running`. */
+  runnerLog: string | null;
+  /** Out-of-band cancel signal: set true by the CLI/TUI, polled by the running worker. */
+  cancelRequested: boolean;
+  cancelRequestedAt: number | null;
   createdAt: number;
   updatedAt: number;
   terminalAt: number | null;
@@ -168,6 +177,10 @@ const ROW_TO_JOB = (r: any): Job => ({
   failureClass: r.failure_class,
   failureDetail: r.failure_detail,
   summary: r.summary,
+  eventsLog: r.events_log ?? null,
+  runnerLog: r.runner_log ?? null,
+  cancelRequested: !!r.cancel_requested,
+  cancelRequestedAt: r.cancel_requested_at ?? null,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   terminalAt: r.terminal_at,
@@ -342,6 +355,102 @@ export class JobStore {
     }
     this.db.prepare(`UPDATE jobs SET ${sets.join(", ")} WHERE id=@id`).run(params);
     this.recordEvent(id, "state_change", { from, to, ...fields });
+  }
+
+  /**
+   * Re-run a job from scratch as a BRAND-NEW job (e.g. a user hit "rerun" on a finished one). We
+   * can't route through `enqueue()` — its identity-key dedupe (including for terminal jobs) would
+   * just hand back the original. So insert directly with a fresh `:rerun:<ulid>` content-hash nonce,
+   * which makes the identity key unique. Everything that drives the create-vs-attach decision
+   * (source/entityId/triggerType/runner/repo/customPrompt) is preserved, so a rerun of a shipped
+   * ticket revises its existing PR exactly as a fresh trigger would — never a duplicate PR.
+   */
+  rerun(jobId: string): Job {
+    const src = this.get(jobId);
+    if (!src) throw new Error(`no job ${jobId}`);
+    const t = this.now();
+    const id = ulid();
+    const contentHash = `${src.contentHash}:rerun:${id}`;
+    const key = identityKey(src.source, src.entityId, src.triggerType, contentHash);
+    this.db
+      .prepare(
+        `INSERT INTO jobs (id, identity_key, source, entity_id, entity_ref, trigger_type, content_hash,
+           state, mode, runner, model, custom_prompt, repo, max_attempts, created_at, updated_at)
+         VALUES (@id,@identity_key,@source,@entity_id,@entity_ref,@trigger_type,@content_hash,
+           'queued',@mode,@runner,@model,@custom_prompt,@repo,@max_attempts,@t,@t)`,
+      )
+      .run({
+        id,
+        identity_key: key,
+        source: src.source,
+        entity_id: src.entityId,
+        entity_ref: src.entityRef ?? src.entityId,
+        trigger_type: src.triggerType,
+        content_hash: contentHash,
+        mode: src.mode,
+        runner: src.runner,
+        model: src.model,
+        custom_prompt: src.customPrompt,
+        repo: src.repo,
+        max_attempts: src.maxAttempts,
+        t,
+      });
+    this.recordEvent(id, "state_change", { from: null, to: "queued", rerunOf: jobId });
+    return this.get(id)!;
+  }
+
+  /**
+   * Retry a failed/needs-attention/abandoned job IN PLACE: reset the same row to queued (attempts
+   * back to 0, clearing the lease/backoff/failure). Sidesteps identity-key dedupe entirely since
+   * it mutates the existing row. For a job that already finished successfully, use `rerun`.
+   */
+  retry(jobId: string): Job {
+    const j = this.get(jobId);
+    if (!j) throw new Error(`no job ${jobId}`);
+    if (!["failed", "needs-attention", "abandoned"].includes(j.state)) {
+      throw new Error(`job ${jobId} is ${j.state}, not retryable (use rerun to re-run a finished job)`);
+    }
+    this.db
+      .prepare(
+        `UPDATE jobs SET state='queued', attempts=0, next_eligible_at=NULL, lease_owner=NULL,
+           lease_expires_at=NULL, failure_class=NULL, failure_detail=NULL, terminal_at=NULL,
+           cancel_requested=0, cancel_requested_at=NULL, updated_at=@t
+         WHERE id=@id`,
+      )
+      .run({ id: jobId, t: this.now() });
+    this.recordEvent(jobId, "state_change", { from: j.state, to: "queued", retried: true });
+    return this.get(jobId)!;
+  }
+
+  /**
+   * Request cancellation of a non-terminal job (CLI/TUI side). Sets an out-of-band flag the running
+   * worker polls; the worker itself performs the kill + the terminal `cancelled` transition, so
+   * there's no cross-process state fight with the lease owner. No-op on already-terminal jobs.
+   */
+  requestCancel(jobId: string): void {
+    const t = this.now();
+    const terminal = `('${TERMINAL_STATES.join("','")}')`;
+    const res = this.db
+      .prepare(`UPDATE jobs SET cancel_requested=1, cancel_requested_at=@t, updated_at=@t WHERE id=@id AND state NOT IN ${terminal}`)
+      .run({ t, id: jobId });
+    if (res.changes > 0) this.recordEvent(jobId, "cancel_requested", {});
+  }
+
+  isCancelRequested(jobId: string): boolean {
+    const r = this.db.prepare("SELECT cancel_requested FROM jobs WHERE id=?").get(jobId) as any;
+    return !!r?.cancel_requested;
+  }
+
+  /**
+   * Cancel a job that hasn't started yet: a `queued` job has no worker/process, so finalize it
+   * straight to `cancelled`. Returns true if it was queued (and is now cancelled), false otherwise
+   * (an active job must instead go through `requestCancel` so its worker does the kill).
+   */
+  cancelQueued(jobId: string): boolean {
+    const j = this.get(jobId);
+    if (!j || j.state !== "queued") return false;
+    this.transition(jobId, "cancelled", { failure_class: "cancelled", failure_detail: "cancelled before it started" });
+    return true;
   }
 
   heartbeat(id: string, leaseMs = 60_000): void {

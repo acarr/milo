@@ -52,7 +52,7 @@ export function pruneWorktrees(
   return removed;
 }
 
-/** Delete `*.log` files in `logsDir` older than `maxAgeDays`. Returns the count deleted. */
+/** Delete old runner logs (`*.log`) and per-job transcripts (`*.events.jsonl`). Returns the count. */
 export function rotateLogs(
   logsDir: string,
   maxAgeDays = 14,
@@ -62,7 +62,7 @@ export function rotateLogs(
   const cutoff = now() - maxAgeDays * 86_400_000;
   let deleted = 0;
   for (const name of readdirSync(logsDir)) {
-    if (!name.endsWith(".log")) continue;
+    if (!name.endsWith(".log") && !name.endsWith(".events.jsonl")) continue;
     const path = join(logsDir, name);
     try {
       if (statSync(path).mtimeMs < cutoff) {
