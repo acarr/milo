@@ -400,6 +400,45 @@ export function retryJob(ref: string): number {
   return 0;
 }
 
+/** `milo repos [--json]` — list configured repositories. */
+export function listRepos(json: boolean): number {
+  const client = createClient();
+  const repos = client.repos();
+  client.close();
+  if (json) {
+    process.stdout.write(JSON.stringify(repos, null, 2) + "\n");
+    return 0;
+  }
+  if (repos.length === 0) {
+    console.log("No repos configured. Add one with: milo add-repo <path>");
+    return 0;
+  }
+  console.log(`${"NAME".padEnd(20)}${"RUNNER".padEnd(8)}${"GITHUB".padEnd(24)}${"TEAMS".padEnd(12)}PATH`);
+  for (const r of repos) {
+    console.log(
+      `${fit(r.name, 19).padEnd(20)}${(r.runner ?? "-").padEnd(8)}${fit(r.githubRepo ?? "-", 23).padEnd(24)}${fit(r.teamKeys.join(",") || "-", 11).padEnd(12)}${r.path}`,
+    );
+  }
+  return 0;
+}
+
+/** `milo remove-repo <name>` — remove a repo from config.json. */
+export function removeRepo(name: string): number {
+  const client = createClient();
+  const res = client.removeRepo(name);
+  client.close();
+  if (!res.ok) {
+    console.error(`[milo] ${res.error}`);
+    return 1;
+  }
+  if (!res.value) {
+    console.error(`[milo] no repo named "${name}".`);
+    return 1;
+  }
+  console.log(`[milo] removed repo "${name}".`);
+  return 0;
+}
+
 /** `milo cancel <ID|jobId>` — cancel a queued or in-flight job (kills the runner if it's running). */
 export function cancelJob(ref: string): number {
   const client = createClient();

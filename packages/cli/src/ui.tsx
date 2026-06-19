@@ -2,7 +2,7 @@ import React from "react";
 import { render, Box, Text, useApp, useInput } from "ink";
 import { useState, useEffect, useRef } from "react";
 import { Scheduler, type PersistedEvent } from "@milo/core";
-import { createClient, type MiloClient, type StateFilter, type SchedulesView as SchedulesData, type ScheduleViewRow } from "./viewmodel.js";
+import { createClient, type MiloClient, type StateFilter, type SchedulesView as SchedulesData, type ScheduleViewRow, type SettingsPatch } from "./viewmodel.js";
 import { runDoctor, type CheckResult } from "./doctor.js";
 import { Header, Footer } from "./components/index.js";
 import { JobsView } from "./views/jobs.js";
@@ -10,7 +10,9 @@ import { JobDetailView } from "./views/job-detail.js";
 import { TranscriptView } from "./views/transcript.js";
 import { SchedulesView } from "./views/schedules.js";
 import { SystemView } from "./views/system.js";
-import type { JobRow, RepoHealthRow } from "./viewmodel.js";
+import { ReposView } from "./views/repos.js";
+import { SettingsPanel, SETTINGS_ROWS } from "./views/settings.js";
+import type { JobRow, RepoHealthRow, RepoSummary, SettingsView } from "./viewmodel.js";
 
 /** A schedule row injected directly into the TUI (test convenience; live data comes from the client). */
 export interface ScheduleRow {
@@ -26,7 +28,9 @@ type View =
   | { name: "job-detail"; jobId: string }
   | { name: "transcript"; jobId: string }
   | { name: "schedules" }
-  | { name: "system" };
+  | { name: "system" }
+  | { name: "repos" }
+  | { name: "settings" };
 
 const STATE_CYCLE: (StateFilter | undefined)[] = [undefined, "active", "failed", "needs-attention", "cancelled", "done"];
 
@@ -35,8 +39,11 @@ const HINTS: Record<string, string> = {
   "jobs-filter": "type to filter · ⏎ apply · esc clear",
   "job-detail": "t transcript · r rerun · R retry · x cancel · esc back · q quit",
   transcript: "esc back · q quit",
-  schedules: "↑/↓ select · ⏎/p run now · 1/2/3 views · q quit",
-  system: "d run doctor · p poll · 1/2/3 views · q quit",
+  schedules: "↑/↓ select · ⏎/p run now · 1-5 views · q quit",
+  system: "d run doctor · p poll · 1-5 views · q quit",
+  repos: "↑/↓ select · d remove · a add (cli) · 1-5 views · q quit",
+  "repos-confirm": "y confirm remove · n cancel",
+  settings: "↑/↓ select · ←/→ change · 1-5 views · q quit",
 };
 
 export function App({
@@ -71,6 +78,11 @@ export function App({
   const [sched, setSched] = useState<SchedulesData>({ rows: [], recent: [] });
   const [schedSel, setSchedSel] = useState(0);
   const [doctor, setDoctor] = useState<CheckResult[] | null>(null);
+  const [repos, setRepos] = useState<RepoSummary[]>([]);
+  const [repoSel, setRepoSel] = useState(0);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const [settingsData, setSettingsData] = useState<SettingsView | undefined>(undefined);
+  const [settingsSel, setSettingsSel] = useState(0);
 
   const filterRef = useRef<{ search?: string; state?: StateFilter }>({});
 
@@ -119,8 +131,22 @@ export function App({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onSchedules]);
 
+  // Load config-backed views (repos/settings) when they open and after edits.
+  const loadRepos = () => {
+    setRepos(client.repos());
+    setConfirmingRemove(false);
+  };
+  const loadSettings = () => setSettingsData(client.settings());
+  useEffect(() => {
+    if (top.name === "repos") loadRepos();
+    if (top.name === "settings") loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [top.name]);
+
   // --- derived ---
   const selId = rows.find((r) => r.id === selectedId)?.id ?? rows[0]?.id ?? null;
+  const repoIdx = Math.min(repoSel, Math.max(0, repos.length - 1));
+  const settingsIdx = Math.min(settingsSel, SETTINGS_ROWS.length - 1);
   const detail = top.name === "job-detail" || top.name === "transcript" ? client.job(top.jobId) : undefined;
   const schedView: SchedulesData =
     schedulesProp && schedulesProp.length
@@ -178,6 +204,28 @@ export function App({
     filterRef.current.state = next;
     refresh();
   };
+  const removeSelectedRepo = () => {
+    const r = repos[repoIdx];
+    setConfirmingRemove(false);
+    if (!r) return;
+    const res = client.removeRepo(r.name);
+    setMessage(res.ok ? (res.value ? `removed ${r.name}` : `${r.name} not found`) : `remove failed: ${res.error}`);
+    loadRepos();
+  };
+  const editSetting = (dir: -1 | 1) => {
+    if (!settingsData) return;
+    const label = SETTINGS_ROWS[settingsIdx];
+    let patch: SettingsPatch;
+    if (label === "default runner") patch = { defaultRunner: settingsData.defaultRunner === "claude" ? "codex" : "claude" };
+    else if (label === "webhook") patch = { webhookEnabled: !settingsData.webhookEnabled };
+    else if (label === "auto-merge PRs") patch = { autoMerge: !settingsData.autoMerge };
+    else patch = { concurrency: Math.max(1, settingsData.concurrency + dir) };
+    const res = client.updateSettings(patch);
+    if (res.ok) {
+      setSettingsData(res.value);
+      setMessage("saved");
+    } else setMessage(`save failed: ${res.error}`);
+  };
 
   // --- input (single handler, dispatched by view + mode) ---
   useInput((input, key) => {
@@ -203,6 +251,13 @@ export function App({
       return;
     }
 
+    // Remove-confirm captures every key (so digits / esc don't leak to the global handlers).
+    if (top.name === "repos" && confirmingRemove) {
+      if (input === "y") removeSelectedRepo();
+      else if (input === "n" || key.escape) setConfirmingRemove(false);
+      return;
+    }
+
     if (input === "q") return exit();
     if (key.escape || key.backspace) {
       if (stack.length > 1) pop();
@@ -211,6 +266,8 @@ export function App({
     if (input === "1") return setStack([{ name: "jobs" }]);
     if (input === "2") return setStack([{ name: "schedules" }]);
     if (input === "3") return setStack([{ name: "system" }]);
+    if (input === "4") return setStack([{ name: "repos" }]);
+    if (input === "5") return setStack([{ name: "settings" }]);
 
     if (top.name === "jobs") {
       if (key.upArrow) return moveSel(-1);
@@ -238,6 +295,20 @@ export function App({
       if (key.return || input === "p") return runSchedule();
       return;
     }
+    if (top.name === "repos") {
+      if (key.upArrow) return setRepoSel((s) => Math.max(0, s - 1));
+      if (key.downArrow) return setRepoSel((s) => Math.min(Math.max(0, repos.length - 1), s + 1));
+      if (input === "d" && repos.length) return setConfirmingRemove(true);
+      if (input === "a") return setMessage("add a repo from the CLI: milo add-repo <path>");
+      return;
+    }
+    if (top.name === "settings") {
+      if (key.upArrow) return setSettingsSel((s) => Math.max(0, s - 1));
+      if (key.downArrow) return setSettingsSel((s) => Math.min(SETTINGS_ROWS.length - 1, s + 1));
+      if (key.leftArrow) return editSetting(-1);
+      if (key.rightArrow || key.return || input === " ") return editSetting(1);
+      return;
+    }
     if (top.name === "system") {
       if (input === "d") {
         // runDoctor is synchronous (it shells out) — defer a tick so the hint paints before it blocks.
@@ -253,7 +324,12 @@ export function App({
     }
   });
 
-  const hintKey = top.name === "jobs" && filtering ? "jobs-filter" : top.name;
+  const hintKey =
+    top.name === "jobs" && filtering
+      ? "jobs-filter"
+      : top.name === "repos" && confirmingRemove
+        ? "repos-confirm"
+        : top.name;
 
   return (
     <Box flexDirection="column" paddingX={1}>
@@ -273,6 +349,15 @@ export function App({
         <SchedulesView rows={schedView.rows} selectedIndex={schedIdx} recent={schedView.recent} now={now} />
       )}
       {top.name === "system" && <SystemView daemon={client.daemon()} health={health} doctor={doctor} />}
+      {top.name === "repos" && <ReposView repos={repos} selectedIndex={repoIdx} confirming={confirmingRemove} />}
+      {top.name === "settings" &&
+        (settingsData ? (
+          <SettingsPanel settings={settingsData} selectedIndex={settingsIdx} />
+        ) : (
+          <Box marginTop={1}>
+            <Text dimColor>no config yet — run `milo init`</Text>
+          </Box>
+        ))}
       <Footer hints={HINTS[hintKey] ?? HINTS["jobs"]!} message={message || undefined} />
     </Box>
   );

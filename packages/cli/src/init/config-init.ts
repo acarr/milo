@@ -70,3 +70,42 @@ export function writeBaseConfig(input: InitConfigInput, path = configPath()): Mi
   }
   return parsed;
 }
+
+/**
+ * Patch settings the in-TUI Settings view can change. Unlike {@link writeBaseConfig} (init-shaped,
+ * one-way), these are BIDIRECTIONAL — webhook/autoMerge can be turned back off. Every other field
+ * (repos, credentials, schedules, trust lists) is preserved; the merged doc is validated before the
+ * file is touched.
+ */
+export interface SettingsPatch {
+  defaultRunner?: "claude" | "codex";
+  webhookEnabled?: boolean;
+  autoMerge?: boolean;
+  concurrency?: number;
+}
+
+export function updateSettings(patch: SettingsPatch, path = configPath()): MiloConfig {
+  const existing: Record<string, unknown> = existsSync(path)
+    ? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
+    : {};
+  const merged: Record<string, unknown> = { version: 2, ...existing };
+
+  if (patch.defaultRunner) {
+    merged["runnerDefaults"] = {
+      ...((existing["runnerDefaults"] as Record<string, unknown>) ?? {}),
+      default: patch.defaultRunner,
+    };
+  }
+  if (patch.webhookEnabled !== undefined) {
+    merged["webhook"] = { ...((existing["webhook"] as Record<string, unknown>) ?? {}), enabled: patch.webhookEnabled };
+  }
+  if (patch.autoMerge !== undefined) {
+    merged["trust"] = { ...((existing["trust"] as Record<string, unknown>) ?? {}), autoMerge: patch.autoMerge };
+  }
+  if (patch.concurrency !== undefined) merged["concurrency"] = patch.concurrency;
+  if (!Array.isArray(merged["repositories"])) merged["repositories"] = [];
+
+  const parsed = MiloConfigSchema.parse(merged);
+  writeFileSync(path, JSON.stringify(merged, null, 2) + "\n");
+  return parsed;
+}

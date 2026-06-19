@@ -18,6 +18,7 @@ import {
   JobStore,
   isDaemonRunning,
   readDaemon,
+  miloHome,
   ACTIVE_STATES,
   TERMINAL_STATES,
   eventsLogPath,
@@ -30,6 +31,11 @@ import {
   type MiloConfig,
   type PersistedEvent,
 } from "@milo/core";
+import { removeRepoConfig } from "./repo-setup/config-writer.js";
+import { updateSettings as writeSettings, type SettingsPatch } from "./init/config-init.js";
+import { isMiloOnPath } from "./init/shell-setup.js";
+
+export type { SettingsPatch };
 
 type Db = ReturnType<typeof openDatabase>;
 
@@ -110,6 +116,27 @@ export interface RepoHealthView {
   rows: RepoHealthRow[];
 }
 
+export interface RepoSummary {
+  name: string;
+  path: string;
+  baseBranch: string;
+  runner: string | null;
+  githubRepo: string | null;
+  teamKeys: string[];
+  packageManager: string;
+}
+
+export interface SettingsView {
+  defaultRunner: string;
+  webhookEnabled: boolean;
+  autoMerge: boolean;
+  concurrency: number;
+  linearConnected: boolean;
+  miloOnPath: boolean;
+  miloHome: string;
+  worktreeBase?: string;
+}
+
 export type ActionResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
 export interface MiloClient {
@@ -137,6 +164,14 @@ export interface MiloClient {
    * its worker honors (kills the runner, skips the verification gate). Already-terminal → error.
    */
   cancel(jobId: string): ActionResult<"cancelled" | "cancel-requested">;
+  /** Configured repositories (for the Repos view / `milo repos`). */
+  repos(): RepoSummary[];
+  /** Remove a repo from config.json (merge-preserving). Returns whether one matched. */
+  removeRepo(name: string): ActionResult<boolean>;
+  /** Editable settings snapshot, or undefined if there's no config yet. */
+  settings(): SettingsView | undefined;
+  /** Patch editable settings (webhook/runner/auto-merge/concurrency), bidirectionally. */
+  updateSettings(patch: SettingsPatch): ActionResult<SettingsView>;
   /** The underlying store, for callers that need a method this client doesn't yet wrap. */
   readonly store: JobStore;
   config(): MiloConfig | undefined;
@@ -196,6 +231,26 @@ export function createClient(opts: { store?: JobStore; db?: Db; config?: MiloCon
       cfg = undefined;
     }
     return cfg;
+  };
+  /** Drop the cached config so the next read reflects a write (remove-repo / settings edit). */
+  const invalidateConfig = () => {
+    cfg = undefined;
+    cfgTried = false;
+  };
+
+  const computeSettings = (): SettingsView | undefined => {
+    const c = getConfig();
+    if (!c) return undefined;
+    return {
+      defaultRunner: c.runnerDefaults.default,
+      webhookEnabled: c.webhook.enabled,
+      autoMerge: c.trust.autoMerge,
+      concurrency: c.concurrency,
+      linearConnected: !!c.linearToken,
+      miloOnPath: isMiloOnPath(),
+      miloHome: miloHome(),
+      worktreeBase: c.worktreeBase,
+    };
   };
 
   return {
@@ -301,6 +356,43 @@ export function createClient(opts: { store?: JobStore; db?: Db; config?: MiloCon
       }
       theStore.requestCancel(jobId);
       return { ok: true, value: "cancel-requested" };
+    },
+
+    repos(): RepoSummary[] {
+      const c = getConfig();
+      return (c?.repositories ?? []).map((r) => ({
+        name: r.name,
+        path: r.path,
+        baseBranch: r.baseBranch,
+        runner: r.defaultRunner ?? null,
+        githubRepo: r.githubRepo ?? null,
+        teamKeys: r.teamKeys,
+        packageManager: r.packageManager,
+      }));
+    },
+
+    removeRepo(name): ActionResult<boolean> {
+      try {
+        const removed = removeRepoConfig(name);
+        invalidateConfig();
+        return { ok: true, value: removed };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    },
+
+    settings(): SettingsView | undefined {
+      return computeSettings();
+    },
+
+    updateSettings(patch): ActionResult<SettingsView> {
+      try {
+        writeSettings(patch);
+        invalidateConfig();
+        return { ok: true, value: computeSettings()! };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
     },
 
     daemon(): DaemonStatus {

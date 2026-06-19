@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import { configPath } from "@milo/core";
 import { runDoctor, printDoctor } from "./doctor.js";
-import { runIssues, runPrompt, listJobs, showJob, watchJob, rerunJob, retryJob, cancelJob, status, tailLog, pollNow, listSchedules, restartDaemon, stopDaemon } from "./run.js";
+import { runIssues, runPrompt, listJobs, showJob, watchJob, rerunJob, retryJob, cancelJob, listRepos, removeRepo, status, tailLog, pollNow, listSchedules, restartDaemon, stopDaemon } from "./run.js";
 import type { JobsFilter, StateFilter } from "./viewmodel.js";
 import { linearAuth } from "./linear-auth.js";
 
@@ -15,6 +15,8 @@ Usage:
   milo init [--sandbox]   guided setup: environment check, Linear, first repo
                           (--sandbox: full dry run — no daemon install or shell-profile writes)
   milo add-repo [path]    wire a git repo into Milo (infers details, maps Linear teams)
+  milo repos [--json]     list configured repositories
+  milo remove-repo <name> remove a repo from config
   milo jobs [--json]      list jobs (filters: --state <s> --repo <r> --search <q>)
   milo job <jobId>        full detail for one job (events, deps, PR, failure)
   milo status [--json]    daemon liveness + queue counts
@@ -78,6 +80,16 @@ async function main(argv: string[]): Promise<number> {
     case "add-repo": {
       const { runAddRepo } = await import("./repo-setup/index.js");
       return runAddRepo(args.slice(1));
+    }
+    case "repos":
+      return listRepos(json);
+    case "remove-repo": {
+      const name = args[1];
+      if (!name) {
+        console.error("usage: milo remove-repo <name>");
+        return 1;
+      }
+      return removeRepo(name);
     }
     case "jobs": {
       const filter: JobsFilter = {};
