@@ -1,6 +1,7 @@
 import React from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
+import { Field, Select, Action, Title } from "../components/index.js";
 import { completePath, type PathCompletion } from "./path-complete.js";
 
 /**
@@ -291,42 +292,23 @@ export function InitWizard({
     }
   });
 
+  // Thin wrappers over the shared component library — keep the wizard's behavior (hint only when
+  // focused, padding-20 toggles, the marginTop on actions) while sharing one implementation.
   const field = (label: string, value: string, focused: boolean, hint?: string) => (
-    <Box>
-      <Text color={focused ? "cyan" : undefined}>{focused ? "› " : "  "}</Text>
-      <Text dimColor>{label.padEnd(16)}</Text>
-      <Text color={focused ? "cyan" : undefined}>{value || <Text dimColor>(empty)</Text>}</Text>
-      {focused && hint ? <Text dimColor>{`   ${hint}`}</Text> : null}
-    </Box>
+    <Field label={label} value={value} focused={focused} hint={focused ? hint : undefined} />
   );
 
   const toggleRow = (label: string, value: string, focused: boolean, hint = "←/→ to change") => (
-    <Box>
-      <Text color={focused ? "cyan" : undefined}>{focused ? "› " : "  "}</Text>
-      <Text dimColor>{label.padEnd(20)}</Text>
-      <Text color={focused ? "cyan" : undefined}>[{value}]</Text>
-      {focused ? <Text dimColor>{`   ${hint}`}</Text> : null}
-    </Box>
+    <Select label={label} value={value} focused={focused} hint={focused ? hint : undefined} labelWidth={20} />
   );
 
   const action = (label: string, focused: boolean, hint: string, disabled = false) => (
     <Box marginTop={1}>
-      <Text color={focused && !disabled ? "cyan" : undefined} dimColor={disabled}>
-        {focused ? "› " : "  "}
-      </Text>
-      <Text bold={!disabled} dimColor={disabled} color={focused && !disabled ? "cyan" : undefined}>
-        {label}
-      </Text>
-      {focused ? <Text dimColor>{`   ${hint}`}</Text> : null}
+      <Action label={label} focused={focused} hint={focused ? hint : undefined} disabled={disabled} />
     </Box>
   );
 
-  /** Step title: bold + orange, with its body starting on the very next line. */
-  const title = (text: string) => (
-    <Text bold color="#ff9900">
-      {text}
-    </Text>
-  );
+  const title = (text: string) => <Title>{text}</Title>;
 
   return (
     <Box flexDirection="column" paddingX={1}>

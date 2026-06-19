@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import { useState } from "react";
 import type { LinearTeam, RepoConfig } from "@milo/core";
+import { Field, Action } from "../components/index.js";
 import type { InferredRepoDefaults } from "./infer.js";
 
 /**
@@ -153,20 +154,10 @@ export function AddRepo({
     else if (optFocus === 2) editText(teardownScript, setTeardownScript, input, key);
   });
 
-  const field = (label: string, value: string, focused: boolean, hint?: string) => (
-    <Box>
-      <Text color={focused ? "cyan" : undefined}>{focused ? "› " : "  "}</Text>
-      <Text dimColor>{label.padEnd(15)}</Text>
-      <Text color={focused ? "cyan" : undefined}>{value || <Text dimColor>(empty)</Text>}</Text>
-      {focused && hint ? <Text dimColor>{`   ${hint}`}</Text> : null}
-    </Box>
-  );
-
-  const action = (label: string, focused: boolean, hint: string) => (
+  // Wrap the shared Action with the wizard's standard top margin.
+  const Next = ({ label, focused, hint }: { label: string; focused: boolean; hint: string }) => (
     <Box marginTop={1}>
-      <Text color={focused ? "cyan" : undefined}>{focused ? "› " : "  "}</Text>
-      <Text bold color={focused ? "cyan" : undefined}>{label}</Text>
-      {focused ? <Text dimColor>{`   ${hint}`}</Text> : null}
+      <Action label={label} focused={focused} hint={focused ? hint : undefined} />
     </Box>
   );
 
@@ -182,12 +173,12 @@ export function AddRepo({
         <Box marginTop={1} flexDirection="column">
           <Text>Confirm the repo details (↑/↓ move · type to edit · Enter for next field):</Text>
           <Box marginTop={1} flexDirection="column">
-            {field("name", name, confirmFocus === 0)}
-            {field("githubRepo", githubRepo, confirmFocus === 1)}
-            {field("baseBranch", baseBranch, confirmFocus === 2)}
-            {field("packageManager", PMS[pmIdx]!, confirmFocus === 3, "←/→ to change")}
+            <Field label="name" value={name} focused={confirmFocus === 0} />
+            <Field label="githubRepo" value={githubRepo} focused={confirmFocus === 1} />
+            <Field label="baseBranch" value={baseBranch} focused={confirmFocus === 2} />
+            <Field label="packageManager" value={PMS[pmIdx]!} focused={confirmFocus === 3} hint={confirmFocus === 3 ? "←/→ to change" : undefined} />
           </Box>
-          {action("Next", confirmFocus === 4, "Enter to continue")}
+          <Next label="Next" focused={confirmFocus === 4} hint="Enter to continue" />
         </Box>
       )}
 
@@ -205,7 +196,7 @@ export function AddRepo({
               </Box>
             ))}
           </Box>
-          {action("Next", teamCursor === teams.length, "Enter to continue")}
+          <Next label="Next" focused={teamCursor === teams.length} hint="Enter to continue" />
         </Box>
       )}
 
@@ -213,11 +204,11 @@ export function AddRepo({
         <Box marginTop={1} flexDirection="column">
           <Text>Optional overrides:</Text>
           <Box marginTop={1} flexDirection="column">
-            {field("defaultRunner", RUNNERS[runnerIdx]!, optFocus === 0, "←/→ to change")}
-            {field("setupScript", setupScript, optFocus === 1)}
-            {field("teardownScript", teardownScript, optFocus === 2)}
+            <Field label="defaultRunner" value={RUNNERS[runnerIdx]!} focused={optFocus === 0} hint={optFocus === 0 ? "←/→ to change" : undefined} />
+            <Field label="setupScript" value={setupScript} focused={optFocus === 1} />
+            <Field label="teardownScript" value={teardownScript} focused={optFocus === 2} />
           </Box>
-          {action("Finish", optFocus === 3, "Enter to finish")}
+          <Next label="Finish" focused={optFocus === 3} hint="Enter to finish" />
         </Box>
       )}
 
