@@ -86,12 +86,12 @@ webhooks, auto-merge — all skip-by-default), then adds your first repo via the
   "concurrency": 3,
   "repositories": [
     {
-      "name": "milo-sandbox",
-      "path": "/Users/you/development/milo-sandbox",
+      "name": "my-app",
+      "path": "/Users/you/development/my-app",
       "baseBranch": "main",
-      "teamKeys": ["SBX"],
+      "teamKeys": ["ENG"],
       "packageManager": "pnpm",
-      "githubRepo": "your-org/milo-sandbox"
+      "githubRepo": "your-org/my-app"
     }
   ]
 }
@@ -167,12 +167,12 @@ Milo is designed to run alongside other agents on the same machine without colli
 
 ---
 
-## The sandbox (for testing)
+## A sandbox for testing
 
-A dedicated sandbox exists for live end-to-end tests:
+For live end-to-end tests, point Milo at a low-stakes repo and a sandbox Linear team:
 
-- Repo: `your-org/milo-sandbox` at `~/development/milo-sandbox` (a Hono task API)
-- Linear team: **Milo Sandbox**, key **`SBX`**
+- A throwaway repo (e.g. `your-org/sandbox-repo`) wired into `config.repositories[]` with a `githubRepo`.
+- A sandbox Linear team — use its team key (e.g. `ENG`) in that repo's `teamKeys`.
 
-Test loop: create an SBX ticket → `milo SBX-N` → watch via `milo jobs` or the TUI → merge the PR and
-confirm Linear auto-closes via `Closes SBX-N`.
+Test loop: create a ticket → `milo ENG-123` → watch via `milo jobs` or the TUI → merge the PR and
+confirm Linear auto-closes via `Closes ENG-123`.

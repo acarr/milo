@@ -119,8 +119,8 @@ needed; no risk of double-running a healthy job.
 | Daemon process crashed | launchd `KeepAlive` + `recoverOnStartup` requeues stranded jobs |
 | Agent wrote code, no PR | verification gate opens the PR |
 | Missed/dropped webhook | polling reconciler (system of record) |
-| Runner finished but never exited (hung MCP children) | run guard: result-exit grace → kill process group, run still succeeds (MILO-16) |
-| Runner hung silent / running forever | run guards: inactivity (~20 min) + wall-clock cap (~3h) → kill process group, verification gate decides the outcome (MILO-16) |
+| Runner finished but never exited (hung MCP children) | run guard: result-exit grace → kill process group, run still succeeds |
+| Runner hung silent / running forever | run guards: inactivity (~20 min) + wall-clock cap (~3h) → kill process group, verification gate decides the outcome |
 
 > Runners spawn `detached` so each leads its own process group — a guard kill takes out the CLI
 > **and** everything it spawned (MCP servers, shells, dev servers). See `packages/runners/src/guards.ts`.

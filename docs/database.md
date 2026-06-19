@@ -18,7 +18,7 @@ One row per unit of work. Primary key `id`; **unique** on `identity_key`.
 | `id` | TEXT PK | Job id. |
 | `identity_key` | TEXT UNIQUE | Hash of `source:entity_id:trigger_type:content_hash` — the dedup key. |
 | `source` | TEXT | `linear` \| `github` \| `schedule` \| `cli`. |
-| `entity_id` | TEXT | e.g. `SBX-5` or `owner/repo#12`. |
+| `entity_id` | TEXT | e.g. `ENG-123` or `owner/repo#12`. |
 | `entity_ref` | TEXT | Display ref (defaults to `entity_id`). |
 | `trigger_type` | TEXT | `issue.start`, `issue.label`, `issue.delegate`, `pr.label`, `pr.mention`, `scheduled`. |
 | `content_hash` | TEXT | Dedup component (timestamp-bearing for re-triggerable work). |
@@ -119,14 +119,14 @@ Guards external writes so retries don't double-post.
 
 ## `job_dependencies` — blockedBy gates
 
-Linear `blockedBy` sequencing (MILO-4). An **unresolved** row makes its dependent unclaimable
+Linear `blockedBy` sequencing. An **unresolved** row makes its dependent unclaimable
 (`claimNext` excludes it in SQL); the async reconciler (`dependencies.ts`) resolves or drops rows as
 blockers finish, merge, fail, or vanish.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `dependent_entity_id` | TEXT PK¹ | The blocked issue (e.g. `SBX-2`). |
-| `blocker_entity_id` | TEXT PK¹ | The issue blocking it (e.g. `SBX-1`). |
+| `dependent_entity_id` | TEXT PK¹ | The blocked issue (e.g. `ENG-124`). |
+| `blocker_entity_id` | TEXT PK¹ | The issue blocking it (e.g. `ENG-123`). |
 | `strategy` | TEXT | `wait` (default) \| `stacked`. |
 | `resolved` | INTEGER | `1` once the blocker no longer gates the dependent. |
 | `blocker_branch` | TEXT | The blocker's head branch — recorded on resolve for `stacked` base-off. |

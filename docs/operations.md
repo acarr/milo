@@ -29,14 +29,14 @@ daemon.
 otherwise SIGTERM-the-pid → wait for the drain → re-spawn detached. Because the daemon runs from source
 via tsx, **restart after pulling new code**.
 
-### Dogfooding
+### Revising a PR via GitHub
 
-GitHub `@milo` attach is **disabled on the public `acarr/milo` repo** — it has no `githubRepo` in
-config, so it isn't GitHub-polled (a public repo would otherwise let anyone trigger a local run). Drive
-milo's own work through Linear `MILO` tickets or `milo <ID>`. For a **private** repo with a `githubRepo`
-set, commenting `@milo <feedback>` on an open PR (or adding the `milo` label) makes Milo revise that PR.
-If the PR's branch is checked out in your dev tree, Milo attaches a detached worktree at the PR head and
-pushes by refspec, so your checkout is never touched.
+GitHub `@milo`/label triggering is **opt-in per repo** via the `githubRepo` config field. For a
+**public** repo, leave `githubRepo` unset or set an explicit `trust.githubActors` allowlist — otherwise
+anyone could `@milo` a PR and trigger a local run (which would execute the PR's setup scripts). For a
+repo that opts in, commenting `@milo <feedback>` on an open PR (or adding the `milo` label) makes Milo
+revise that PR. If the PR's branch is checked out in your dev tree, Milo attaches a detached worktree at
+the PR head and pushes by refspec, so your checkout is never touched.
 
 Only **one** process drains the queue. `milo <ID>` defers to a running daemon (enqueue-only); if no
 daemon is up it drains inline.
@@ -71,7 +71,7 @@ $MILO_HOME/logs/
 ```
 
 ```bash
-milo logs SBX-5                       # latest runner log for an issue
+milo logs ENG-123                     # latest runner log for an issue
 tail -f ~/.milo/logs/daemon.log       # follow the daemon
 ```
 

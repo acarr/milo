@@ -32,7 +32,7 @@ Response codes: `200` (enqueued **or** intentionally ignored), `401` (bad signat
    left to polling.
 4. Actor gate against `trust.linearActors` (empty = allow all).
 5. Enqueue via the same path as the poller (`issue.delegate`), or ignore. Create-mode Linear jobs
-   enqueue with a **dependency hold** (`dependencies.holdMs`, default 60s — MILO-15): the job is
+   enqueue with a **dependency hold** (`dependencies.holdMs`, default 60s): the job is
    unclaimable until the ingress-triggered `syncDependencies` records its `blockedBy` edges and
    releases the hold. This is what keeps two issues delegated together (a blocker and its dependent)
    from racing into parallel runs — webhook delivery order doesn't matter; if Linear can't be

@@ -76,7 +76,7 @@ keys are scrubbed from the env to force subscription auth.
 Under `-s workspace-write` Codex commits via an alternate `GIT_OBJECT_DIRECTORY` (it cannot touch the
 real `.git`), so it leaves the working tree **dirty with no branch commit**. That's fine — the
 [verification gate](./reliability.md#the-verification-gate) sees the dirty tree and commits/pushes/opens
-the PR itself. **Don't "fix" Codex's git;** the gate is the proven backstop (e.g. SBX-7 → PR #7).
+the PR itself. **Don't "fix" Codex's git;** the gate is the reliable backstop.
 
 ---
 
@@ -124,7 +124,7 @@ similar but omits step 6 (the PR already exists) and uses the `@milo` instructio
 
 ---
 
-## Run guards (MILO-16)
+## Run guards
 
 Both runners spawn their CLI **detached** (the child leads its own process group) and arm three
 watchdogs (`packages/runners/src/guards.ts`) that kill the **whole process group** — the CLI plus
@@ -136,12 +136,11 @@ every MCP server / shell / dev server it spawned:
 | Inactivity | 20 min | No stdout/stderr at all | Run resolves with a non-zero code; the verification gate decides the real outcome |
 | Wall clock | 3h | The run exceeded the absolute cap | Same as inactivity |
 
-The guards exist because of a live incident (2026-06-02): two `claude -p` runs finished their work,
-pushed their PRs, emitted their final results — and then never exited, because user-scope MCP servers
-(`context7`, `chrome-devtools`) kept the CLI alive. The jobs sat in `running` for 4.5 hours holding
-their entity locks and worktrees; the lease watchdog correctly refused to reclaim them (their
-heartbeats were healthy). Guards make hung-CLI a non-event: the run resolves, verification confirms
-ground truth, the job completes.
+The guards exist because a runner CLI can finish its work — push its PR, emit its final result — and
+then never exit, because user-scope MCP servers (e.g. `context7`, `chrome-devtools`) keep the CLI
+alive. Without a guard, such a job sits in `running` for hours holding its entity lock and worktree,
+and the lease watchdog correctly refuses to reclaim it (its heartbeats are healthy). Guards make a
+hung CLI a non-event: the run resolves, verification confirms ground truth, the job completes.
 
 Codex has no reliable terminal stream event, so only the inactivity + wall-clock guards apply there
 (completion is signaled by process exit). Timeouts are overridable per run via the `guards` option;

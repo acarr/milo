@@ -89,7 +89,7 @@ Schedule (cron)             ┘
 
 ```bash
 # 1. clone + install
-git clone https://github.com/acarr/milo && cd milo
+git clone https://github.com/your-org/milo && cd milo
 pnpm install && pnpm typecheck && pnpm test
 
 # 2. put `milo` on PATH
