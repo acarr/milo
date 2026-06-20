@@ -5,14 +5,14 @@
 <h1 align="center">Milo</h1>
 
 <p align="center">
-  <em>A locally-running autonomous coding agent that ships real PRs — reliably, on your own subscription.</em>
+  <em>A locally-running autonomous coding agent that reliably ships real PRs.</em>
 </p>
 
 ---
 
 Hand Milo a Linear ticket, an `@milo` mention on a GitHub PR, a CLI command, or a schedule, and it works
 the task end-to-end **on your machine** — worktree → implement → verify → PR → update Linear/GitHub —
-using your **Claude or Codex subscription** (never API billing).
+using your **Claude or Codex subscription**.
 
 ## Why Milo exists
 
@@ -89,7 +89,7 @@ Schedule (cron)             ┘
 
 ```bash
 # 1. clone + install
-git clone https://github.com/acarr/milo && cd milo
+git clone https://github.com/your-org/milo && cd milo
 pnpm install && pnpm typecheck && pnpm test
 
 # 2. put `milo` on PATH

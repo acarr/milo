@@ -21,7 +21,7 @@ Every intent carries:
 | Field | Meaning |
 |-------|---------|
 | `source` | `linear` \| `github` \| `schedule` \| `cli` |
-| `entityId` | Stable per-source id — e.g. `SBX-5`, `owner/name#12` |
+| `entityId` | Stable per-source id — e.g. `ENG-123`, `owner/name#12` |
 | `triggerType` | `issue.start`, `issue.label`, `issue.delegate`, `pr.label`, `pr.mention`, `scheduled` |
 | `contentHash` | Dedup key (defaults to `entityId`); carries a timestamp for re-triggerable work |
 | `mode` | `create` (new branch + PR) \| `attach` (existing PR branch) |
@@ -60,7 +60,7 @@ also **revives a `stale` session to `active`**), an `action` activity (`opened_p
 the URL), and a terminal `response` (success) or `error` (blocker) activity. If there's no agent
 session, it falls back to a normal issue **comment**. On success it moves the ticket to **In Review**.
 
-**Live progress streaming (MILO-5).** Between setup and the PR, Milo streams the agent's real
+**Live progress streaming.** Between setup and the PR, Milo streams the agent's real
 activity into the session — meaningful file edits, commands, test runs, and milestone narration —
 so the transcript reads like watching it work instead of going silent for minutes. The runner emits
 a normalized, runner-agnostic event stream (Claude `stream-json`, Codex `--json`); `core`'s
@@ -81,9 +81,10 @@ GitHub triggers are **opt-in per repo** — only repos with a `githubRepo: "owne
 are polled (this keeps Milo off other tools' shared clones). The GitHub poller (`pollGithub`) watches **open
 PRs** in those repos for:
 
-> GitHub `@milo`/label triggers require a `githubRepo` in config (opt-in polling). The **public
-> `acarr/milo` repo has this disabled** — drive its own work via Linear `MILO` tickets / `milo <ID>`.
-> The triggers below apply to repos that opt in (e.g. a private sandbox).
+> GitHub `@milo`/label triggers require a `githubRepo` in config (opt-in polling). For a **public**
+> repo, leave `githubRepo` unset or set an explicit `trust.githubActors` allowlist — otherwise anyone
+> could `@milo` a PR and trigger a local run (which would execute the PR's setup scripts). The triggers
+> below apply to repos that opt in.
 
 ### a) The `milo` label on a PR
 → `triggerType: pr.label`, `contentHash: <slug>#<number>:label` (fires once).
@@ -107,7 +108,7 @@ Webhook actor gating (`trust.githubActors`) applies when webhooks are on; empty 
 ## 3. CLI
 
 ```bash
-milo SBX-5 WAZ-12
+milo ENG-123 WEB-45
 ```
 
 Enqueues issues directly as `cli`-source jobs (`triggerType: issue.start`). If the daemon is up they're

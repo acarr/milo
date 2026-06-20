@@ -69,7 +69,7 @@ MILO_HOME=$(mktemp -d) milo init --sandbox   # disposable, completable, fresh-in
 
 ## `milo <ID> [<ID>...]`
 
-Enqueue one or more Linear issues. IDs must match `^[A-Z][A-Z0-9]*-\d+$` (e.g. `SBX-5`, `WAZ-12`).
+Enqueue one or more Linear issues. IDs must match `^[A-Z][A-Z0-9]*-\d+$` (e.g. `ENG-123`, `WEB-45`).
 
 - **Daemon running** → the issue is enqueued and the daemon picks it up; the command returns
   immediately (enqueue-only). It does **not** drain inline, so it never clobbers the daemon's

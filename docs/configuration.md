@@ -39,7 +39,7 @@ The list of repos Milo can work in. Each entry:
 | `name` | string | **required** | Repo identifier; also the circuit-breaker key. |
 | `path` | string | **required** | Absolute path to the local clone. Worktrees branch off this. |
 | `baseBranch` | string | `"main"` | Branch new feature branches are cut from / PRs target. |
-| `teamKeys` | string[] | `[]` | Linear team keys this repo serves (e.g. `["SBX"]`). Used to route an issue → repo. |
+| `teamKeys` | string[] | `[]` | Linear team keys this repo serves (e.g. `["ENG"]`). Used to route an issue → repo. |
 | `packageManager` | `"npm"`\|`"pnpm"`\|`"yarn"` | `"npm"` | Used by the generic worktree setup (`<pm> install`). |
 | `setupScript` | string | — | Script run in each fresh worktree (instead of the generic copy-env + install). |
 | `teardownScript` | string | — | Script run when tearing a worktree down (instead of `git worktree remove`). |
@@ -142,7 +142,7 @@ A per-repo `progress` object overrides any subset of these for that repo.
 
 ## `dependencies`
 
-Sequencing for Linear `blockedBy` relations (MILO-4): a blocked issue is held unclaimable until its
+Sequencing for Linear `blockedBy` relations: a blocked issue is held unclaimable until its
 blocker no longer gates it, instead of both racing in parallel against `main`.
 
 ```json
@@ -153,7 +153,7 @@ blocker no longer gates it, instead of both racing in parallel against `main`.
 |-------|---------|-------------|
 | `enabled` | `true` | Master switch. Disabling also clears any already-recorded gates on the next reconcile, so nothing stays stuck. |
 | `defaultStrategy` | `"wait"` | `wait`: hold the dependent until the blocker's **PR merges**, then run it fresh against the updated base. `stacked`: once the blocker is **done**, base the dependent's worktree/PR off the blocker's head branch (the PRs stack). |
-| `holdMs` | `60000` | The enqueue-time discovery window (MILO-15): a fresh Linear create job is unclaimable for up to this long, giving `syncDependencies` time to record its `blockedBy` edges (the hold releases early once they are). Closes the webhook/poll enqueue→claim race; `0` disables holds. |
+| `holdMs` | `60000` | The enqueue-time discovery window: a fresh Linear create job is unclaimable for up to this long, giving `syncDependencies` time to record its `blockedBy` edges (the hold releases early once they are). Closes the webhook/poll enqueue→claim race; `0` disables holds. |
 
 A `stacked` / `wait` (or `milo:stacked` / `milo:wait` / `wait-for-merge`) **label on the dependent
 issue** overrides the default for that issue. Cycles, blockers Milo isn't tracking, terminally-failed
@@ -236,8 +236,8 @@ GitHub vs schedule — is a planned nice-to-have.)
   },
   "webhook": { "enabled": false, "host": "127.0.0.1", "port": 3457 },
   "trust": {
-    "linearActors": ["alex"],
-    "githubActors": ["wrinklefull"],
+    "linearActors": ["alice"],
+    "githubActors": ["alice"],
     "webhookSecrets": { "linear": "…", "github": "…" }
   },
   "schedules": [
@@ -245,12 +245,12 @@ GitHub vs schedule — is a planned nice-to-have.)
   ],
   "repositories": [
     {
-      "name": "milo-sandbox",
-      "path": "/Users/you/development/milo-sandbox",
+      "name": "my-app",
+      "path": "/Users/you/development/my-app",
       "baseBranch": "main",
-      "teamKeys": ["SBX"],
+      "teamKeys": ["ENG"],
       "packageManager": "pnpm",
-      "githubRepo": "your-org/milo-sandbox",
+      "githubRepo": "your-org/my-app",
       "defaultRunner": "claude",
       "teardownPolicy": "always"
     }

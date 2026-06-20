@@ -56,7 +56,7 @@ scanned — the same opt-in posture as GitHub polling.
 ### Run one now
 
 ```bash
-milo prompt <repo>:<name>   # e.g. milo prompt milo-sandbox:nightly-tidy
+milo prompt <repo>:<name>   # e.g. milo prompt my-app:nightly-tidy
 milo prompt <name>          # bare name when unambiguous across repos
 ```
 

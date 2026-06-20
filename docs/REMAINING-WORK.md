@@ -1,8 +1,8 @@
 # Milo — Remaining Work
 
-_Last updated: 2026-05-31. Phases 0–6 + the two headline reliability follow-ups (circuit breaker,
-lease watchdog) are shipped and on `main`. Everything below is **optional** — Milo is fully usable
-today via the `milo` label, `@milo` PR mentions, the CLI, and schedules._
+_Everything below is **optional** — Milo is fully usable today via the `milo` label, `@milo` PR
+mentions, the CLI, and schedules. The headline features (durable queue, verification gate, circuit
+breaker, lease watchdog, scheduler, webhooks) are shipped._
 
 Priority legend: **P1** = do soon / clear value · **P2** = worth doing · **P3** = nice-to-have.
 Effort is rough developer-time on top of the current codebase.
@@ -33,10 +33,6 @@ still backstops, so this is purely an accelerator.
 KeepAlive) so the daemon survives logout/reboot/crash. Today the daemon is started by hand
 (`milo daemon`). **Why:** "never silently fails to start" wants the daemon itself to be always-on.
 
-### A3. Clean up the SBX test artifacts · **P3** · ~5 min
-Sandbox PRs **#5–#7** and tickets **SBX-5/6/7** (In Review) are leftover live-test artifacts. Merging
-each PR auto-closes its Linear ticket via `Closes SBX-N`. Or close them if you don't want the changes.
-
 ---
 
 ## B. Reliability hardening (code)
@@ -51,14 +47,14 @@ fix its own omission (better commit message / PR body) before the mechanical fal
   `core/prompt.ts`; reuse the existing runner registry.
 - **Risk:** low — cycle 2 remains the guaranteed backstop, so a failed cycle 1 changes nothing.
 
-### ~~B2. Runaway-runner wall-clock kill~~ · ✅ **DONE (MILO-16)**
+### ~~B2. Runaway-runner wall-clock kill~~ · ✅ **DONE**
 Shipped as **run guards** (`runners/guards.ts`): every runner spawns `detached` (its own process
 group) and is watched by three guards that kill the whole tree — **result-exit grace** (the CLI
 emitted its final result but didn't exit within ~30s → kill, run still counts as success),
 **inactivity** (~20 min with no output → kill), and **wall clock** (~3h cap → kill). No abort handle
 or pipeline change was needed — the guards live inside `runClaude`/`runCodex`, and the verification
-gate already derives the real outcome from git/GitHub state after any kill. Hit live 2026-06-02:
-two finished `claude -p` runs hung 4.5h because their MCP-server children kept them alive.
+gate already derives the real outcome from git/GitHub state after any kill. This closes the failure
+mode where a finished `claude -p` run hangs for hours because its MCP-server children keep it alive.
 
 ### B3. Multi-model fallback chain actually exercised · **P2** · ~0.5 day
 `runnerDefaults.{claude,codex}.modelChain` is defined (e.g. `opus → sonnet → haiku`) but only the
@@ -94,7 +90,7 @@ worktree, and push back to the contributor's branch where permitted.
 ### C2. Secrets migration (`config.json` → `~/.milo/secrets/`) · **P2** · ~0.5 day
 Linear OAuth tokens still live in `config.json`. The plan wanted them in `~/.milo/secrets/*.json`
 (0600) so dashboards/exports/git never see them, with transparent 401 refresh (already implemented in
-`linear.ts`). Webhook secrets (added in Phase 6) should move there too.
+`linear.ts`). Webhook secrets should move there too.
 
 - **Where:** `core/config.ts` load/migrate + `core/linear.ts` token persistence + a `secretsDir()`
   reader (the path helper already exists).
@@ -132,7 +128,7 @@ before the worktree is even set up.
 
 ## Suggested order
 
-1. **A2** (always-on daemon) and **A3** (clean up test PRs) — quick, operational.
+1. **A2** (always-on daemon) — quick, operational.
 2. **B1** (focused remediation) and **B2** (runaway kill) — close the two real reliability gaps.
 3. **A1 + C4** (webhooks + instant ack) — biggest UX win for the Linear agent chat.
 4. **C2** (secrets) and **C3** (TUI panels) — hygiene + observability.
