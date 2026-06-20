@@ -29,3 +29,18 @@ export function appendRepoConfig(input: unknown, path = configPath()): RepoConfi
   writeFileSync(path, JSON.stringify(raw, null, 2) + "\n");
   return repo;
 }
+
+/**
+ * Remove a repo (by `name`) from config.json, preserving every other field. Returns true if a repo
+ * was removed, false if none matched. Throws (before touching the file) if the config is missing.
+ */
+export function removeRepoConfig(name: string, path = configPath()): boolean {
+  if (!existsSync(path)) throw new Error(`Config not found at ${path}.`);
+  const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  const repos = Array.isArray(raw["repositories"]) ? (raw["repositories"] as RepoConfig[]) : [];
+  const next = repos.filter((r) => r?.name !== name);
+  if (next.length === repos.length) return false;
+  raw["repositories"] = next;
+  writeFileSync(path, JSON.stringify(raw, null, 2) + "\n");
+  return true;
+}

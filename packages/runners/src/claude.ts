@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { dirname, delimiter } from "node:path";
 import type { RunnerEvent, RunnerEventSink } from "@milo/core";
-import { RunGuards, type GuardTimeouts } from "./guards.js";
+import { RunGuards, onAbortKill, type GuardTimeouts } from "./guards.js";
 
 export interface ClaudeRunOptions {
   cwd: string;
@@ -14,6 +14,8 @@ export interface ClaudeRunOptions {
   echo?: NodeJS.WritableStream;
   /** Receive normalized progress events as the run streams (best-effort). */
   onEvent?: RunnerEventSink;
+  /** Abort the run (user-initiated cancel) — kills the whole runner process group. */
+  signal?: AbortSignal;
   /** Override the run-guard timeouts (MILO-16). Tests use tiny values; production uses the defaults. */
   guards?: Partial<GuardTimeouts>;
   /** Override the binary to spawn — a test seam so guard behavior can be exercised with a fake CLI. */
@@ -138,6 +140,15 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
       emit({ kind: "notice", text: `Runner guard fired: ${reason}` });
     });
 
+    // User-initiated cancel: kill the whole runner tree. `close` still fires and resolves below;
+    // the pipeline detects the cancel from its own AbortController and skips the verification gate.
+    const disposeAbort = onAbortKill(opts.signal, child.pid, () => {
+      const note = `\n[milo] cancellation requested — killing the runner process group\n`;
+      log.write(note);
+      opts.echo?.write(note);
+      emit({ kind: "notice", text: "Cancellation requested — stopping the runner." });
+    });
+
     /** Append plain text to the reconstructed output + mirror it to the echo stream. */
     const appendText = (s: string) => {
       output += s.endsWith("\n") ? s : s + "\n";
@@ -202,11 +213,13 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
 
     child.on("error", (err) => {
       guards.clear();
+      disposeAbort();
       log.end();
       reject(err);
     });
     child.on("close", (code) => {
       guards.clear();
+      disposeAbort();
       if (stdoutBuf.trim()) handleLine(stdoutBuf); // flush any partial trailing line
       log.end();
       // A guard kill after the final result is still a successful run — the output is complete and

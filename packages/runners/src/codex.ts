@@ -3,7 +3,7 @@ import { createWriteStream, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, delimiter, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { RunnerEvent, RunnerEventSink } from "@milo/core";
-import { RunGuards, type GuardTimeouts } from "./guards.js";
+import { RunGuards, onAbortKill, type GuardTimeouts } from "./guards.js";
 
 export interface CodexRunOptions {
   cwd: string;
@@ -16,6 +16,8 @@ export interface CodexRunOptions {
   echo?: NodeJS.WritableStream;
   /** Receive normalized progress events as the run streams (best-effort). */
   onEvent?: RunnerEventSink;
+  /** Abort the run (user-initiated cancel) — kills the whole runner process group. */
+  signal?: AbortSignal;
   /** Override the run-guard timeouts (MILO-16). Tests use tiny values; production uses the defaults. */
   guards?: Partial<GuardTimeouts>;
   /** Override the binary to spawn — a test seam so guard behavior can be exercised with a fake CLI. */
@@ -169,6 +171,15 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexRunResult> {
       emit({ kind: "notice", text: `Runner guard fired: ${reason}` });
     });
 
+    // User-initiated cancel: kill the whole runner tree. `close` still fires and resolves below;
+    // the pipeline detects the cancel from its own AbortController and skips the verification gate.
+    const disposeAbort = onAbortKill(opts.signal, child.pid, () => {
+      const note = `\n[milo] cancellation requested — killing the runner process group\n`;
+      log.write(note);
+      opts.echo?.write(note);
+      emit({ kind: "notice", text: "Cancellation requested — stopping the runner." });
+    });
+
     let stdoutBuf = "";
     const handleLine = (line: string) => {
       const trimmed = line.trim();
@@ -207,11 +218,13 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexRunResult> {
 
     child.on("error", (err) => {
       guards.clear();
+      disposeAbort();
       log.end();
       reject(err);
     });
     child.on("close", (code) => {
       guards.clear();
+      disposeAbort();
       // Append the clean final message so MILO_RESULT is parseable (JSONL escapes it otherwise).
       let lastMsg = "";
       try {

@@ -32,6 +32,14 @@ database, operations).
 - **Always-on daemon + Ink TUI**, an **in-daemon scheduler + maintenance** (worktree prune, log
   rotation, disk guard), and an opt-in **HMAC webhook accelerator** layered on top of polling (polling
   stays the system of record).
+- **Operate from one place** — a shared CLI view-model client (`packages/cli/src/viewmodel.ts`) backs
+  both the plain commands and a k9s-style **multi-view TUI** (tabbed jobs / schedules / system / repos /
+  settings; Tab or 1-5 to switch). Drill into a job to watch its **live transcript** — the normalized
+  runner event stream, teed to a redacted per-job `<jobId>.events.jsonl` (`core/transcript.ts`) and
+  surfaced via the transcript view + `milo watch`. **Re-run / retry / cancel** jobs (cancel threads an
+  `AbortSignal` through the runners to `killTree` the process group, then skips the verification gate).
+  Repos and settings are **editable in-TUI** (merge-preserving writers). New DB columns `events_log` /
+  `runner_log` / `cancel_requested` and terminal state `cancelled` (idempotent migration; schema → 4).
 
 ## Architecture
 
@@ -97,17 +105,23 @@ milo <ID> [<ID>...]   # enqueue issues (daemon runs them, else inline). e.g. mil
 milo poll             # one-shot Linear+GitHub poll → enqueue any new work
 milo schedules [--json] # list scheduled automations (next/last run)
 milo prompt <repo>:<name> # run an in-repo scheduled prompt now (from <repo>/.milo/schedules.json)
-milo jobs [--json]    # list jobs from the store
+milo jobs [--json]    # list jobs (filters: --state <s> --repo <r> --search <q>)
+milo job <jobId>      # full detail for one job (events, deps, PR, failure)
+milo watch <ID|jobId> # stream a job's live transcript (replay + tail); --json = raw JSONL
+milo rerun <ID|jobId> # re-run a job from scratch; retry = re-queue a failed one in place
+milo cancel <ID|jobId> # cancel a queued/in-flight job (kills the runner)
 milo status [--json]  # daemon liveness + queue counts
-milo logs <ID>        # latest runner log for an issue
+milo logs <ID>        # latest RAW runner log for an issue (watch = normalized transcript)
 milo daemon           # always-on worker: queue + pollers + scheduler (or launchd: scripts/install-launchd.sh)
 milo restart [--force] # restart the daemon (picks up new code; launchd-aware). milo stop = stop it
 
-milo                  # interactive Ink TUI (bare); milo ui is the same
-milo doctor [--json]  # environment checks
+milo                  # interactive Ink TUI (bare); milo ui is the same. Tab/1-5 switch views;
+                      #   ⏎ detail, t transcript, r/R/x rerun/retry/cancel, p poll, / search, f filter
+milo doctor [--json]  # environment checks (also the TUI System view: key 3 → d)
 milo init             # guided onboarding: env check → paths → Linear → opt-ins → first repo → doctor
 milo linear-auth      # (re)register the Linear agent
 milo add-repo [path]  # wire a git repo into config.json (infers details, maps Linear teams via TUI)
+milo repos [--json]   # list configured repos (TUI Repos view: key 4); milo remove-repo <name>
 ```
 `milo` goes on PATH via a symlink `~/.local/bin/milo` → `bin/milo.mjs` (run through `tsx`).
 

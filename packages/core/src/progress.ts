@@ -65,10 +65,16 @@ const SECRET_PATTERNS: RegExp[] = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
 ];
 
+/** Replace obvious secrets (OAuth/API tokens, JWTs, private-key headers) with a placeholder. */
+export function redactSecrets(s: string): string {
+  let out = s ?? "";
+  for (const p of SECRET_PATTERNS) out = out.replace(p, "«redacted»");
+  return out;
+}
+
 /** Collapse whitespace, redact obvious secrets, and bound length — nothing huge or sensitive leaks. */
 export function sanitize(s: string, max = MAX_LEN): string {
-  let out = (s ?? "").replace(/\s+/g, " ").trim();
-  for (const p of SECRET_PATTERNS) out = out.replace(p, "«redacted»");
+  let out = redactSecrets((s ?? "").replace(/\s+/g, " ").trim());
   if (out.length > max) out = out.slice(0, max - 1) + "…";
   return out;
 }
