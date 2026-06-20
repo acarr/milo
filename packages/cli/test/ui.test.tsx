@@ -68,12 +68,12 @@ test("t opens the transcript view", async () => {
   assert.match(frame, /transcript/, "shows the transcript view");
 });
 
-test("Right arrow and Tab switch between view tabs", async () => {
+test("Tab cycles between view tabs", async () => {
   const { lastFrame, stdin, unmount } = render(<App store={storeWithJobs()} />);
   await delay(40);
-  stdin.write("[C"); // Right arrow: jobs → schedules
+  stdin.write("\t"); // Tab: jobs → schedules
   await delay(60);
-  assert.match(lastFrame() ?? "", /Scheduled/, "right arrow moved to the schedules tab");
+  assert.match(lastFrame() ?? "", /Scheduled/, "Tab moved to the schedules tab");
   stdin.write("\t"); // Tab: schedules → system
   await delay(60);
   assert.match(lastFrame() ?? "", /System/, "Tab moved to the system tab");

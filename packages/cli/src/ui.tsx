@@ -38,13 +38,13 @@ const STATE_CYCLE: (StateFilter | undefined)[] = [undefined, "active", "failed",
 const TABS = ["jobs", "schedules", "system", "repos", "settings"] as const;
 
 const HINTS: Record<string, string> = {
-  jobs: "↑/↓ select · ⏎ detail · t transcript · r/R/x rerun/retry/cancel · p poll · / search · f filter · ←→/⇥ tabs · q quit",
+  jobs: "↑/↓ select · ⏎ detail · t transcript · r/R/x rerun/retry/cancel · p poll · / search · f filter · ⇥ tabs · q quit",
   "jobs-filter": "type to filter · ⏎ apply · esc clear",
   "job-detail": "t transcript · r rerun · R retry · x cancel · esc back · q quit",
   transcript: "esc back · ⇥ tabs · q quit",
-  schedules: "↑/↓ select · ⏎/p run now · ←→/⇥ tabs · q quit",
-  system: "d run doctor · p poll · ←→/⇥ tabs · q quit",
-  repos: "↑/↓ select · d remove · a add (cli) · ←→/⇥ tabs · q quit",
+  schedules: "↑/↓ select · ⏎/p run now · ⇥ tabs · q quit",
+  system: "d run doctor · p poll · ⇥ tabs · q quit",
+  repos: "↑/↓ select · d remove · a add (cli) · ⇥ tabs · q quit",
   "repos-confirm": "y confirm remove · n cancel",
   settings: "↑/↓ select · ←/→ change · ⇥ tabs · q quit",
 };
@@ -288,8 +288,6 @@ export function App({
     if (input === "5") return setStack([{ name: "settings" }]);
 
     if (top.name === "jobs") {
-      if (key.leftArrow) return switchTab(-1);
-      if (key.rightArrow) return switchTab(1);
       if (key.upArrow) return moveSel(-1);
       if (key.downArrow) return moveSel(1);
       if (key.return && selId) return push({ name: "job-detail", jobId: selId });
@@ -310,16 +308,12 @@ export function App({
       return;
     }
     if (top.name === "schedules") {
-      if (key.leftArrow) return switchTab(-1);
-      if (key.rightArrow) return switchTab(1);
       if (key.upArrow) return setSchedSel((s) => Math.max(0, s - 1));
       if (key.downArrow) return setSchedSel((s) => Math.min(schedView.rows.length - 1, s + 1));
       if (key.return || input === "p") return runSchedule();
       return;
     }
     if (top.name === "repos") {
-      if (key.leftArrow) return switchTab(-1);
-      if (key.rightArrow) return switchTab(1);
       if (key.upArrow) return setRepoSel((s) => Math.max(0, s - 1));
       if (key.downArrow) return setRepoSel((s) => Math.min(Math.max(0, repos.length - 1), s + 1));
       if (input === "d" && repos.length) return setConfirmingRemove(true);
@@ -334,8 +328,6 @@ export function App({
       return;
     }
     if (top.name === "system") {
-      if (key.leftArrow) return switchTab(-1);
-      if (key.rightArrow) return switchTab(1);
       if (input === "d") {
         // runDoctor is synchronous (it shells out) — defer a tick so the hint paints before it blocks.
         setMessage("running environment checks…");
