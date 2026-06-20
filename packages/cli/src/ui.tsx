@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import { Scheduler, type PersistedEvent } from "@milo/core";
 import { createClient, type MiloClient, type StateFilter, type SchedulesView as SchedulesData, type ScheduleViewRow, type SettingsPatch } from "./viewmodel.js";
 import { runDoctor, type CheckResult } from "./doctor.js";
-import { Header, Footer } from "./components/index.js";
+import { Header, Footer, Tabs } from "./components/index.js";
 import { JobsView } from "./views/jobs.js";
 import { JobDetailView } from "./views/job-detail.js";
 import { TranscriptView } from "./views/transcript.js";
@@ -34,16 +34,19 @@ type View =
 
 const STATE_CYCLE: (StateFilter | undefined)[] = [undefined, "active", "failed", "needs-attention", "cancelled", "done"];
 
+/** The top-level views, in tab order — ⇥ / ←→ / 1-5 move between them. */
+const TABS = ["jobs", "schedules", "system", "repos", "settings"] as const;
+
 const HINTS: Record<string, string> = {
-  jobs: "↑/↓ select · ⏎ detail · t transcript · r rerun · R retry · x cancel · p poll · / search · f filter · 1/2/3 views · q quit",
+  jobs: "↑/↓ select · ⏎ detail · t transcript · r/R/x rerun/retry/cancel · p poll · / search · f filter · ←→/⇥ tabs · q quit",
   "jobs-filter": "type to filter · ⏎ apply · esc clear",
   "job-detail": "t transcript · r rerun · R retry · x cancel · esc back · q quit",
-  transcript: "esc back · q quit",
-  schedules: "↑/↓ select · ⏎/p run now · 1-5 views · q quit",
-  system: "d run doctor · p poll · 1-5 views · q quit",
-  repos: "↑/↓ select · d remove · a add (cli) · 1-5 views · q quit",
+  transcript: "esc back · ⇥ tabs · q quit",
+  schedules: "↑/↓ select · ⏎/p run now · ←→/⇥ tabs · q quit",
+  system: "d run doctor · p poll · ←→/⇥ tabs · q quit",
+  repos: "↑/↓ select · d remove · a add (cli) · ←→/⇥ tabs · q quit",
   "repos-confirm": "y confirm remove · n cancel",
-  settings: "↑/↓ select · ←/→ change · 1-5 views · q quit",
+  settings: "↑/↓ select · ←/→ change · ⇥ tabs · q quit",
 };
 
 export function App({
@@ -145,6 +148,15 @@ export function App({
 
   // --- derived ---
   const selId = rows.find((r) => r.id === selectedId)?.id ?? rows[0]?.id ?? null;
+  // Scrolling window: render only a terminal-height page of jobs, keeping the selection in view.
+  const PAGE = Math.max(6, (process.stdout.rows ?? 30) - 11);
+  const selIndexAll = Math.max(0, rows.findIndex((r) => r.id === selId));
+  const winStart = Math.max(0, Math.min(selIndexAll - Math.floor(PAGE / 2), Math.max(0, rows.length - PAGE)));
+  const visibleJobRows = rows.slice(winStart, winStart + PAGE);
+  const jobsPageInfo =
+    rows.length > PAGE
+      ? `${winStart + 1}–${Math.min(winStart + PAGE, rows.length)} of ${rows.length}`
+      : `${rows.length} job${rows.length === 1 ? "" : "s"}`;
   const repoIdx = Math.min(repoSel, Math.max(0, repos.length - 1));
   const settingsIdx = Math.min(settingsSel, SETTINGS_ROWS.length - 1);
   const detail = top.name === "job-detail" || top.name === "transcript" ? client.job(top.jobId) : undefined;
@@ -203,6 +215,11 @@ export function App({
     setStateFilter(next);
     filterRef.current.state = next;
     refresh();
+  };
+  const switchTab = (dir: 1 | -1) => {
+    const cur = TABS.indexOf(stack[0]!.name as (typeof TABS)[number]);
+    const i = cur < 0 ? 0 : (cur + dir + TABS.length) % TABS.length;
+    setStack([{ name: TABS[i]! } as View]);
   };
   const removeSelectedRepo = () => {
     const r = repos[repoIdx];
@@ -263,6 +280,7 @@ export function App({
       if (stack.length > 1) pop();
       return;
     }
+    if (key.tab) return switchTab(key.shift ? -1 : 1);
     if (input === "1") return setStack([{ name: "jobs" }]);
     if (input === "2") return setStack([{ name: "schedules" }]);
     if (input === "3") return setStack([{ name: "system" }]);
@@ -270,6 +288,8 @@ export function App({
     if (input === "5") return setStack([{ name: "settings" }]);
 
     if (top.name === "jobs") {
+      if (key.leftArrow) return switchTab(-1);
+      if (key.rightArrow) return switchTab(1);
       if (key.upArrow) return moveSel(-1);
       if (key.downArrow) return moveSel(1);
       if (key.return && selId) return push({ name: "job-detail", jobId: selId });
@@ -290,12 +310,16 @@ export function App({
       return;
     }
     if (top.name === "schedules") {
+      if (key.leftArrow) return switchTab(-1);
+      if (key.rightArrow) return switchTab(1);
       if (key.upArrow) return setSchedSel((s) => Math.max(0, s - 1));
       if (key.downArrow) return setSchedSel((s) => Math.min(schedView.rows.length - 1, s + 1));
       if (key.return || input === "p") return runSchedule();
       return;
     }
     if (top.name === "repos") {
+      if (key.leftArrow) return switchTab(-1);
+      if (key.rightArrow) return switchTab(1);
       if (key.upArrow) return setRepoSel((s) => Math.max(0, s - 1));
       if (key.downArrow) return setRepoSel((s) => Math.min(Math.max(0, repos.length - 1), s + 1));
       if (input === "d" && repos.length) return setConfirmingRemove(true);
@@ -310,6 +334,8 @@ export function App({
       return;
     }
     if (top.name === "system") {
+      if (key.leftArrow) return switchTab(-1);
+      if (key.rightArrow) return switchTab(1);
       if (input === "d") {
         // runDoctor is synchronous (it shells out) — defer a tick so the hint paints before it blocks.
         setMessage("running environment checks…");
@@ -334,8 +360,16 @@ export function App({
   return (
     <Box flexDirection="column" paddingX={1}>
       <Header daemon={daemon.running} pid={daemon.pid} counts={counts} />
+      <Tabs active={stack[0]!.name} />
       {top.name === "jobs" && (
-        <JobsView rows={rows} selectedId={selId} filtering={filtering} filterText={filterText} stateFilter={stateFilter} />
+        <JobsView
+          rows={visibleJobRows}
+          selectedId={selId}
+          filtering={filtering}
+          filterText={filterText}
+          stateFilter={stateFilter}
+          pageInfo={jobsPageInfo}
+        />
       )}
       {top.name === "job-detail" && detail && <JobDetailView detail={detail} />}
       {top.name === "transcript" && (

@@ -176,6 +176,35 @@ export function Header({
   );
 }
 
+/** The top-level view tabs. The active one is highlighted; 1-5 / ⇥ / ←→ switch between them. */
+export function Tabs({ active }: { active: string }) {
+  const tabs: [string, string][] = [
+    ["1", "jobs"],
+    ["2", "schedules"],
+    ["3", "system"],
+    ["4", "repos"],
+    ["5", "settings"],
+  ];
+  return (
+    <Box marginTop={1}>
+      {tabs.map(([n, name]) => {
+        const on = name === active;
+        return (
+          <Text
+            key={name}
+            bold={on}
+            color={on ? "black" : undefined}
+            backgroundColor={on ? ACCENT : undefined}
+            dimColor={!on}
+          >
+            {` ${n}·${name} `}
+          </Text>
+        );
+      })}
+    </Box>
+  );
+}
+
 /** A context-sensitive keybinding hint line plus an optional transient status message. */
 export function Footer({ hints, message }: { hints: string; message?: string }) {
   return (

@@ -13,23 +13,28 @@ export function JobsView({
   filtering,
   filterText,
   stateFilter,
+  pageInfo,
 }: {
   rows: JobRow[];
   selectedId: string | null;
   filtering: boolean;
   filterText: string;
   stateFilter?: string;
+  pageInfo?: string;
 }) {
   const showFilterBar = filtering || filterText.length > 0 || !!stateFilter;
   return (
     <Box flexDirection="column" marginTop={1}>
-      {showFilterBar && (
-        <Box>
-          <Text dimColor>filter  </Text>
-          {stateFilter ? <Text color="yellow">{`state:${stateFilter}  `}</Text> : null}
-          <Text color={filtering ? "cyan" : undefined}>{`/${filterText}${filtering ? "▏" : ""}`}</Text>
-        </Box>
-      )}
+      <Box>
+        {pageInfo ? <Text dimColor>{`${pageInfo}   `}</Text> : null}
+        {showFilterBar ? (
+          <>
+            <Text dimColor>filter </Text>
+            {stateFilter ? <Text color="yellow">{`state:${stateFilter} `}</Text> : null}
+            <Text color={filtering ? "cyan" : undefined}>{`/${filterText}${filtering ? "▏" : ""}`}</Text>
+          </>
+        ) : null}
+      </Box>
       {rows.length === 0 ? (
         <Text dimColor>no jobs match — try `milo SBX-1`, or press f/ to change the filter</Text>
       ) : (

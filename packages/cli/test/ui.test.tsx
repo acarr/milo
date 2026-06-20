@@ -31,7 +31,8 @@ test("TUI renders the header and job rows (default jobs view)", async () => {
   assert.match(frame, /SBX-7/, "shows an enqueued/running job");
   assert.match(frame, /SBX-8/, "shows a second job");
   assert.match(frame, /running/, "renders job state");
-  assert.match(frame, /views · q quit/, "shows the jobs footer hints");
+  assert.match(frame, /tabs · q quit/, "shows the jobs footer hints");
+  assert.match(frame, /1·jobs/, "shows the tab bar");
 });
 
 test("pressing 2 switches to the Scheduled view", async () => {
@@ -65,6 +66,18 @@ test("t opens the transcript view", async () => {
   const frame = lastFrame() ?? "";
   unmount();
   assert.match(frame, /transcript/, "shows the transcript view");
+});
+
+test("Right arrow and Tab switch between view tabs", async () => {
+  const { lastFrame, stdin, unmount } = render(<App store={storeWithJobs()} />);
+  await delay(40);
+  stdin.write("[C"); // Right arrow: jobs → schedules
+  await delay(60);
+  assert.match(lastFrame() ?? "", /Scheduled/, "right arrow moved to the schedules tab");
+  stdin.write("\t"); // Tab: schedules → system
+  await delay(60);
+  assert.match(lastFrame() ?? "", /System/, "Tab moved to the system tab");
+  unmount();
 });
 
 test("system view renders via key 3", async () => {
