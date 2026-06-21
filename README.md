@@ -42,13 +42,6 @@ See **[docs/reliability.md](./docs/reliability.md)**.
 
 ## What it does
 
-```
-Linear (label / delegation)  ┐
-GitHub (label / @milo)       ├─► one durable SQLite queue ─► worktree ─► runner (Claude/Codex)
-CLI (milo ENG-123)           │                                            ─► verify ─► PR ─► report back
-Schedule (cron)              ┘
-```
-
 - **Assign work four ways** — a `milo` label or agent delegation in Linear, a `milo` label / `@milo`
   comment on a GitHub PR, the `milo <ID>` CLI, or a cron schedule.
 - **Isolated execution** — each job runs in its own git worktree, with per-repo setup and teardown.
