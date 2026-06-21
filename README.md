@@ -16,21 +16,17 @@ using your **Claude or Codex subscription**.
 
 ## Why Milo exists
 
-Most "autonomous coding agent" products run your work in someone else's cloud and bill you per token.
-That's a poor fit for a lot of real software, and it tends to be unreliable in exactly the ways that
-matter when no one is watching. Milo takes the opposite bet:
+Running local agents that respond to events and schedules was flaky. If they sucessfully started they may not finish. And if they finish, they may not create a PR requiring a manual nudge for the agent to continue. Milo tries to minmize these issues.
 
 - **Real work needs a real machine.** Native iOS/Android builds need actual simulators and emulators;
   backend changes need Postgres, Redis, Docker, and open ports; integration tests need the whole stack
-  wired together. A cloud sandbox can't do that. Milo runs locally, where your toolchain already works.
-- **Reliability over cleverness.** An agent that occasionally drops a ticket on the floor — or finishes
-  and forgets to open a PR — isn't usable unattended. Milo is built around two hard guarantees (below),
+  wired together. A cloud sandbox cannot always cover all of these scenarios and can be expensive. Milo runs locally, where your toolchain already works.
+- **Reliability over cleverness.** An agent that occasionally drops a ticket or forgets to open a PR isn't usable unattended. Milo is built around two hard guarantees,
   a durable SQLite queue, retries with backoff, a per-repo circuit breaker, and a lease watchdog that
   requeues work whose worker died. Nothing silently vanishes.
-- **Your subscription, not API billing.** Milo drives your existing Claude or Codex subscription — no
-  per-token API charges.
+- **Your subscription, not API billing.** Milo uses your existing Claude or Codex subscription (as long as that is still an option).
 - **Meets work where it already lives.** A `milo` label or agent delegation in Linear, an `@milo` on a
-  GitHub PR, the `milo <ID>` CLI, or a cron schedule — all funnel into the same pipeline.
+  GitHub PR, the `milo <ID>` CLI, or a cron schedule, all using the same pipeline.
 
 ## The two guarantees
 
@@ -47,10 +43,10 @@ See **[docs/reliability.md](./docs/reliability.md)**.
 ## What it does
 
 ```
-Linear (label / delegation) ┐
+Linear (label / delegation)  ┐
 GitHub (label / @milo)       ├─► one durable SQLite queue ─► worktree ─► runner (Claude/Codex)
-CLI (milo ENG-123)          │                                            ─► verify ─► PR ─► report back
-Schedule (cron)             ┘
+CLI (milo ENG-123)           │                                            ─► verify ─► PR ─► report back
+Schedule (cron)              ┘
 ```
 
 - **Assign work four ways** — a `milo` label or agent delegation in Linear, a `milo` label / `@milo`
