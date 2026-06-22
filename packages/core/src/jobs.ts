@@ -313,7 +313,7 @@ export class JobStore {
    *    strategy resolves it (blocker done for stacked, blocker PR merged for wait).
    * Returns the claimed Job, or undefined if nothing is runnable right now.
    */
-  claimNext(owner: string, leaseMs = 60_000): Job | undefined {
+  claimNext(owner: string, leaseMs = 120_000): Job | undefined {
     const t = this.now();
     const active = `('${ACTIVE_STATES.join("','")}')`;
     const tx = this.db.transaction(() => {
@@ -453,7 +453,7 @@ export class JobStore {
     return true;
   }
 
-  heartbeat(id: string, leaseMs = 60_000): void {
+  heartbeat(id: string, leaseMs = 120_000): void {
     const t = this.now();
     this.db
       .prepare("UPDATE jobs SET last_heartbeat_at=@t, lease_expires_at=@exp WHERE id=@id")
@@ -727,11 +727,13 @@ export class JobStore {
   }
 
   /**
-   * Watchdog: requeue active jobs whose lease has expired (+ grace). With the pipeline
-   * heartbeating during long runs, an expired lease means the worker is genuinely gone (a hung or
-   * crashed runner that no daemon restart reclaimed). Returns the number reclaimed.
+   * Watchdog: requeue active jobs whose lease has expired (+ grace). The pipeline heartbeats every
+   * 30s through its WHOLE active lifecycle — including the once-blocking worktree setup, now that it's
+   * async — so a lapsed lease means the worker is genuinely gone. The lease (120s) + grace (60s) give
+   * ~6 missed beats of slack before reclaim, so a transient stall (a GC pause, brief sync work) can't
+   * SIGTERM a healthy runner; only a real death does. Returns the number reclaimed.
    */
-  reclaimExpiredLeases(graceMs = 30_000): number {
+  reclaimExpiredLeases(graceMs = 60_000): number {
     const t = this.now();
     const active = `('${ACTIVE_STATES.join("','")}')`;
     const stranded = this.db

@@ -177,11 +177,11 @@ export function makeProcessJob(deps: PipelineDeps) {
       logger.info({ worktreePath }, "keeping worktree for debugging");
       return;
     }
-    try {
-      teardownWorktree(repo, worktreePath);
-    } catch (err) {
-      logger.warn({ err: (err as Error).message }, "teardown had issues");
-    }
+    // Best-effort cleanup — fire-and-forget so a heavy teardown script doesn't block the caller (the
+    // job is already in its terminal state by here). `teardownWorktree` is async; swallow rejections.
+    void teardownWorktree(repo, worktreePath).catch((err) =>
+      logger.warn({ err: (err as Error).message }, "teardown had issues"),
+    );
   }
 
   /**
@@ -285,7 +285,9 @@ export function makeProcessJob(deps: PipelineDeps) {
     const stackedBase = store.stackedBaseFor(job.entityId);
     if (stackedBase) thought(`Stacking on the blocker's branch \`${stackedBase}\` (this PR will target it).`);
     try {
-      worktree = createWorktree(repo, job.entityId, issue.title, worktreeBase(config.worktreeBase), stackedBase);
+      worktree = await withHeartbeat(job.id, () =>
+        createWorktree(repo, job.entityId, issue.title, worktreeBase(config.worktreeBase), stackedBase),
+      );
     } catch (err) {
       await failWorktreeSetup(job, repo.name, err as Error, async (msg) => {
         if (sessionId) await linear.agentError(sessionId, msg);
@@ -463,7 +465,9 @@ export function makeProcessJob(deps: PipelineDeps) {
     // branch is checked out elsewhere (e.g. the developer's tree), attachWorktree falls back to a
     // detached worktree at its head, so this only throws on real failures.
     try {
-      worktree = attachWorktree(repo, `${job.entityId}-revise`, prior.branch, prior.baseBranch, worktreeBase(config.worktreeBase));
+      worktree = await withHeartbeat(job.id, () =>
+        attachWorktree(repo, `${job.entityId}-revise`, prior.branch, prior.baseBranch, worktreeBase(config.worktreeBase)),
+      );
     } catch (err) {
       await failWorktreeSetup(job, repo.name, err as Error, async (msg) => {
         if (sessionId) await linear.agentError(sessionId, msg);
@@ -606,7 +610,9 @@ export function makeProcessJob(deps: PipelineDeps) {
 
     const wtKey = `${repo.name}-pr-${number}`;
     try {
-      worktree = attachWorktree(repo, wtKey, pr.headRefName, pr.baseRefName, worktreeBase(config.worktreeBase));
+      worktree = await withHeartbeat(job.id, () =>
+        attachWorktree(repo, wtKey, pr.headRefName, pr.baseRefName, worktreeBase(config.worktreeBase)),
+      );
     } catch (err) {
       await failWorktreeSetup(job, repo.name, err as Error, async (msg) => void addPrComment(slug, number, msg));
       return;
@@ -720,7 +726,9 @@ export function makeProcessJob(deps: PipelineDeps) {
     // branch mirrors the key (no doubled schedule slug): feature/prompt-<repo>-<name>-<id6>.
     const runKey = `${job.entityId}-${job.id.slice(-6)}`.toLowerCase();
     try {
-      worktree = createWorktree(repo, runKey, ref, worktreeBase(config.worktreeBase), undefined, `feature/${runKey}`);
+      worktree = await withHeartbeat(job.id, () =>
+        createWorktree(repo, runKey, ref, worktreeBase(config.worktreeBase), undefined, `feature/${runKey}`),
+      );
     } catch (err) {
       await failWorktreeSetup(job, repo.name, err as Error);
       return;
