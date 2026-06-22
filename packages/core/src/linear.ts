@@ -56,6 +56,29 @@ function persistTokens(path: string, token: string, refreshToken?: string): void
   writeFileSync(path, JSON.stringify(raw, null, 2) + "\n");
 }
 
+/**
+ * Agent-session statuses the poll backstop should (re)claim for Milo:
+ *  - `pending`: a fresh delegation awaiting work.
+ *  - `error`:   a delegation Linear errored because its webhook was dropped/late (the freshness-401
+ *               bug). Re-surfacing it is safe — enqueue dedupes on `session:<id>`, so a session that
+ *               already produced a job is a no-op and only a never-enqueued one is recovered.
+ */
+export const RECOVERABLE_AGENT_SESSION_STATUSES = new Set(["pending", "error"]);
+
+/** Whether an agent-session node is one Milo should claim: a recoverable status, owned by Milo's
+ * app user, and attached to an issue. Pure + exported so the poll filter is unit-testable. */
+export function isRecoverableAgentSession(
+  s: { status?: string; appUser?: { id?: string }; issue?: { identifier?: string } },
+  appUserId: string,
+): boolean {
+  return (
+    !!s.status &&
+    RECOVERABLE_AGENT_SESSION_STATUSES.has(s.status) &&
+    s.appUser?.id === appUserId &&
+    !!s.issue?.identifier
+  );
+}
+
 export class LinearClient {
   private token: string;
   private readonly creds: LinearCredentials;
@@ -248,9 +271,15 @@ export class LinearClient {
   }
 
   /**
-   * Agent sessions delegated to Milo that are awaiting work (status `pending`). This is the
-   * native Linear "delegate to agent" hand-off (UI or @mention). Returns the session id (for
-   * idempotency / future activity replies) alongside the issue identifier.
+   * Agent sessions delegated to Milo that still need work — the native Linear "delegate to agent"
+   * hand-off (UI or @mention). Returns the session id (for idempotency / activity replies) alongside
+   * the issue identifier.
+   *
+   * Includes both `pending` and `error` sessions: a delegation whose webhook was dropped/late (the
+   * historical freshness-401 bug) leaves the session `error`, and polling is meant to be the system of
+   * record. Re-surfacing an errored session is safe because enqueue dedupes on `session:<id>` — a
+   * session that already produced a (terminal or in-flight) job is a no-op, so only a session that was
+   * never turned into a job actually gets recovered here.
    */
   async pendingAgentSessions(): Promise<{ sessionId: string; issueIdentifier: string }[]> {
     const data = await this.query<{ agentSessions: { nodes: any[] } }>(
@@ -260,7 +289,7 @@ export class LinearClient {
     );
     const me = await this.viewerId();
     return (data.agentSessions?.nodes ?? [])
-      .filter((s) => s.status === "pending" && s.appUser?.id === me && s.issue?.identifier)
+      .filter((s) => isRecoverableAgentSession(s, me))
       .map((s) => ({ sessionId: s.id, issueIdentifier: s.issue.identifier }));
   }
 
