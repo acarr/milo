@@ -111,9 +111,20 @@ export function startWebhookServer(deps: WebhookDeps): () => void {
           return send(401, "bad signature");
         }
         const payload = JSON.parse(raw.toString("utf8"));
-        if (!isFreshTimestamp(payload.webhookTimestamp)) {
+        // `AgentSessionEvent` is a delegation / agent-session hand-off. Linear retries late deliveries
+        // (its own servers, plus a momentarily busy daemon, can push delivery minutes past
+        // `webhookTimestamp`), and a 401 makes Linear ERROR the session — which `pendingAgentSessions`
+        // can no longer re-surface (it returns status:"pending" only), so the work is lost for good.
+        // Signature verification (above) + identity-key dedupe (contentHash `session:<id>`, shared with
+        // the poll backstop) already make replay a no-op, so freshness adds ~nothing here. Enqueue the
+        // delegation regardless of age. NB: follow-up *revisions* ride the poller's `prompt:<id>` path
+        // (LinearClient.pendingFollowupPrompts), not this normalizer, so this stays regression-free.
+        const isAgentSession = payload?.type === "AgentSessionEvent";
+        if (!isAgentSession && !isFreshTimestamp(payload.webhookTimestamp)) {
+          // A stale non-delegation event: skip it, but ACK with 200 (not 401) so Linear stops retrying
+          // and never errors a session over a delivery that was merely late. Recorded for audit.
           store.recordInbound({ source: "linear", channel: "webhook", payload, disposition: "rejected", reason: "stale timestamp" });
-          return send(401, "stale");
+          return send(200, "stale-ignored");
         }
         const intent = normalizeLinearWebhook(payload, config);
         if (!intent) {
