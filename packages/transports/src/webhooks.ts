@@ -27,6 +27,7 @@ export function normalizeLinearWebhook(payload: any, config: MiloConfig): JobInt
     mode: "create",
     repo: resolveRepo(config, teamKey)?.name ?? teamKey,
     actor,
+    sessionId,
   };
 }
 

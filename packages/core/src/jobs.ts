@@ -305,6 +305,30 @@ export class JobStore {
   }
 
   /**
+   * Would a job just enqueued for `entityId` have to WAIT rather than start ~immediately? True when
+   * another run for the same entity is already active (per-entity serialization forces a wait), or
+   * when at least `concurrency` other non-terminal jobs are already ahead of it (the cap/queue is
+   * full). Call this right AFTER enqueue (the new queued job is counted, then subtracted). Used to
+   * decide whether to tell the user their delegation is "queued" — so we never say that for work that
+   * actually starts right away. A best-effort snapshot; the claim happens a moment later.
+   */
+  willQueue(entityId: string, concurrency: number): boolean {
+    const activePlaceholders = ACTIVE_STATES.map(() => "?").join(",");
+    const activeForEntity = this.db
+      .prepare(`SELECT 1 FROM jobs WHERE entity_id = ? AND state IN (${activePlaceholders}) LIMIT 1`)
+      .get(entityId, ...ACTIVE_STATES);
+    if (activeForEntity) return true;
+    const terminalPlaceholders = TERMINAL_STATES.map(() => "?").join(",");
+    const nonTerminal = (
+      this.db
+        .prepare(`SELECT COUNT(*) c FROM jobs WHERE state NOT IN (${terminalPlaceholders})`)
+        .get(...TERMINAL_STATES) as { c: number }
+    ).c;
+    // Subtract the just-enqueued job itself; if `concurrency` others are ahead, this one waits.
+    return nonTerminal - 1 >= concurrency;
+  }
+
+  /**
    * Atomically claim the next runnable job:
    *  - state = queued and eligible (backoff elapsed)
    *  - no OTHER job for the same entity is currently active (per-entity serialization)

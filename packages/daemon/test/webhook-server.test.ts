@@ -16,14 +16,27 @@ function freshStore(): JobStore {
   return new JobStore(openDatabase(join(mkdtempSync(join(os.tmpdir(), "milo-wh-")), "milo.db")));
 }
 
-function makeConfig(port: number) {
+function makeConfig(port: number, concurrency = 3) {
   return MiloConfigSchema.parse({
     repositories: [{ name: "sandbox", path: "/nope", teamKeys: ["SBX"] }],
     webhook: { enabled: true, host: "127.0.0.1", port },
     trust: { webhookSecrets: { linear: SECRET } },
+    concurrency,
     // Keep the fire-and-forget dependency sync (which would call Linear) inert in tests.
     dependencies: { enabled: false },
   });
+}
+
+/** A LinearClient stand-in that records the agent-session thoughts the server posts. */
+function recordingLinear() {
+  const thoughts: { sessionId: string; body: string }[] = [];
+  return {
+    thoughts,
+    agentThought: (sessionId: string, body: string) => {
+      thoughts.push({ sessionId, body });
+      return Promise.resolve(true);
+    },
+  } as any;
 }
 
 const sign = (body: string) => createHmac("sha256", SECRET).update(body).digest("hex");
@@ -56,13 +69,28 @@ async function post(port: number, body: string, sig: string | undefined): Promis
 }
 
 /** Run a block against a started webhook server, always tearing it down. */
-async function withServer(store: JobStore, fn: (port: number) => Promise<void>): Promise<void> {
+async function withServer(
+  store: JobStore,
+  fn: (port: number) => Promise<void>,
+  opts: { linear?: any; concurrency?: number } = {},
+): Promise<void> {
   const port = nextPort++;
-  const stop = startWebhookServer({ config: makeConfig(port), store, linear: {} as any });
+  const stop = startWebhookServer({
+    config: makeConfig(port, opts.concurrency),
+    store,
+    linear: opts.linear ?? ({} as any),
+  });
   try {
     await fn(port);
   } finally {
     stop();
+  }
+}
+
+/** Pre-fill the queue with N waiting jobs so the next delegation is over the cap (will wait). */
+function fillQueue(store: JobStore, n: number): void {
+  for (let i = 0; i < n; i++) {
+    store.enqueue({ source: "linear", entityId: `FILL-${i}`, triggerType: "issue.delegate", repo: "sandbox" });
   }
 }
 
@@ -114,4 +142,52 @@ test("a bad signature is still rejected with 401", async () => {
     assert.equal(res.status, 401);
     assert.equal(store.list().length, 0);
   });
+});
+
+test("a delegation that must WAIT (cap full) posts exactly one queued ack", async () => {
+  const store = freshStore();
+  const linear = recordingLinear();
+  fillQueue(store, 3); // cap = 3, so the incoming delegation is the 4th → it waits
+  await withServer(
+    store,
+    async (port) => {
+      const body = agentSessionEvent("sess-q", "SBX-50", 0);
+      await post(port, body, sign(body));
+    },
+    { linear, concurrency: 3 },
+  );
+  const acks = linear.thoughts.filter((t: any) => t.sessionId === "sess-q");
+  assert.equal(acks.length, 1, "a waiting delegation should get one queued ack");
+  assert.match(acks[0].body, /[Qq]ueued/);
+});
+
+test("a delegation that starts immediately gets NO queued ack", async () => {
+  const store = freshStore();
+  const linear = recordingLinear();
+  await withServer(
+    store,
+    async (port) => {
+      const body = agentSessionEvent("sess-now", "SBX-60", 0);
+      await post(port, body, sign(body));
+    },
+    { linear, concurrency: 3 },
+  );
+  assert.equal(linear.thoughts.length, 0, "no queued ack when a slot is free — claim-time msg is authoritative");
+  assert.ok(store.latestJobForEntity("SBX-60"), "the job is still enqueued");
+});
+
+test("replaying a waiting delegation does not post a second queued ack", async () => {
+  const store = freshStore();
+  const linear = recordingLinear();
+  fillQueue(store, 3);
+  await withServer(
+    store,
+    async (port) => {
+      const body = agentSessionEvent("sess-rq", "SBX-70", 0);
+      await post(port, body, sign(body)); // created → ack
+      await post(port, body, sign(body)); // deduped → no ack
+    },
+    { linear, concurrency: 3 },
+  );
+  assert.equal(linear.thoughts.filter((t: any) => t.sessionId === "sess-rq").length, 1);
 });

@@ -52,6 +52,7 @@ test("normalizeLinearWebhook turns an AgentSessionEvent into a create intent", (
   assert.equal(intent?.contentHash, "session:sess-1");
   assert.equal(intent?.repo, "sandbox");
   assert.equal(intent?.actor, "alex");
+  assert.equal(intent?.sessionId, "sess-1"); // raw sessionId threaded for the queued-ack
 });
 
 test("normalizeLinearWebhook ignores non-agent-session events", () => {
@@ -98,6 +99,16 @@ const fakeLinear = (issues: any[], sessions: any[] = [], followups: any[] = []) 
     pendingAgentSessions: async () => sessions,
     pendingFollowupPrompts: async () => followups,
   }) as any;
+
+test("pollLinear emits a delegate (create) intent carrying the raw sessionId", async () => {
+  const sessions = [{ sessionId: "sess-42", issueIdentifier: "SBX-8" }];
+  const intents = await pollLinear(fakeLinear([], sessions), config);
+  const d = intents.find((i) => i.triggerType === "issue.delegate");
+  assert.ok(d, "delegate intent present");
+  assert.equal(d!.entityId, "SBX-8");
+  assert.equal(d!.contentHash, "session:sess-42");
+  assert.equal(d!.sessionId, "sess-42"); // threaded so the ingest path can post a queued ack
+});
 
 test("pollLinear emits a revise (attach) intent for a follow-up prompt in an existing agent session", async () => {
   const followups = [
