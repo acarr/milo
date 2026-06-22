@@ -59,6 +59,34 @@ function git(repoPath: string, args: string[], inherit = false): Promise<{ code:
   return run("git", ["-C", repoPath, ...args], { inherit });
 }
 
+/**
+ * Serialize the shared-clone git mutations (fetch / `git worktree add|remove|prune`) per repo. A
+ * worktree shares the main clone's ref + object store, so two jobs setting up against the SAME repo
+ * concurrently race git's ref locks — `git fetch origin main` from one fails mid-flight with
+ * "incorrect old value provided" while the other rewrites `refs/remotes/origin/main`. Before setup
+ * was async this never happened (the blocking spawnSync accidentally ran setups one-at-a-time); now
+ * that the event loop stays free, same-repo jobs interleave and collide. This per-repo-path mutex
+ * restores safe ordering for just the git critical section — `runSetup` (pnpm install, setup
+ * scripts) runs OUTSIDE it, in the per-job worktree dir, so same-repo jobs still set up concurrently
+ * and the loop stays responsive.
+ */
+const repoGitLocks = new Map<string, Promise<unknown>>();
+function withRepoGitLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+  const prev = repoGitLocks.get(repoPath) ?? Promise.resolve();
+  // Run fn after prev settles (success OR failure — one job's git error must not wedge the next).
+  const next = prev.then(fn, fn);
+  // Park a swallow-rejections tail as the new lock so the chain can't leak unhandled rejections; the
+  // real result/rejection still flows to this caller via `next`.
+  repoGitLocks.set(
+    repoPath,
+    next.then(
+      () => {},
+      () => {},
+    ),
+  );
+  return next;
+}
+
 export function branchSlug(title: string): string {
   return title
     .toLowerCase()
@@ -103,15 +131,17 @@ export async function createWorktree(
 
   mkdirSync(worktreeBasePath, { recursive: true });
   logger.info({ branch, base }, "Creating worktree");
-  const fetched = await git(repo.path, ["fetch", "origin", base, "--quiet"]);
-  if (fetched.code !== 0) throw new Error(`git fetch failed: ${fetched.stderr}`);
+  await withRepoGitLock(repo.path, async () => {
+    const fetched = await git(repo.path, ["fetch", "origin", base, "--quiet"]);
+    if (fetched.code !== 0) throw new Error(`git fetch failed: ${fetched.stderr}`);
 
-  let add = await git(repo.path, ["worktree", "add", "-b", branch, worktreePath, `origin/${base}`]);
-  if (add.code !== 0) {
-    // Branch may already exist — attach to it.
-    add = await git(repo.path, ["worktree", "add", worktreePath, branch]);
-    if (add.code !== 0) throw new Error(`Failed to create worktree: ${add.stderr}`);
-  }
+    let add = await git(repo.path, ["worktree", "add", "-b", branch, worktreePath, `origin/${base}`]);
+    if (add.code !== 0) {
+      // Branch may already exist — attach to it.
+      add = await git(repo.path, ["worktree", "add", worktreePath, branch]);
+      if (add.code !== 0) throw new Error(`Failed to create worktree: ${add.stderr}`);
+    }
+  });
 
   await runSetup(repo, worktreePath, issueId);
   return { path: worktreePath, branch, baseBranch: base };
@@ -133,9 +163,12 @@ export async function attachWorktree(
 
   if (existsSync(join(worktreePath, ".git"))) {
     logger.info({ worktreePath }, "Reusing existing attach worktree");
-    await git(worktreePath, ["fetch", "origin", headBranch, "--quiet"]);
-    await git(worktreePath, ["reset", "--hard", `origin/${headBranch}`]);
-    const detached = (await git(worktreePath, ["symbolic-ref", "-q", "HEAD"])).code !== 0;
+    // The fetch mutates the shared ref store even when invoked from the worktree dir — lock it.
+    const detached = await withRepoGitLock(repo.path, async () => {
+      await git(worktreePath, ["fetch", "origin", headBranch, "--quiet"]);
+      await git(worktreePath, ["reset", "--hard", `origin/${headBranch}`]);
+      return (await git(worktreePath, ["symbolic-ref", "-q", "HEAD"])).code !== 0;
+    });
     return { path: worktreePath, branch: headBranch, baseBranch, detached };
   }
   if (existsSync(worktreePath)) {
@@ -144,20 +177,22 @@ export async function attachWorktree(
 
   mkdirSync(worktreeBasePath, { recursive: true });
   logger.info({ headBranch, baseBranch }, "Attaching worktree to existing PR branch");
-  const fetched = await git(repo.path, ["fetch", "origin", headBranch, "--quiet"]);
-  if (fetched.code !== 0) throw new Error(`git fetch ${headBranch} failed: ${fetched.stderr}`);
+  const detached = await withRepoGitLock(repo.path, async () => {
+    const fetched = await git(repo.path, ["fetch", "origin", headBranch, "--quiet"]);
+    if (fetched.code !== 0) throw new Error(`git fetch ${headBranch} failed: ${fetched.stderr}`);
 
-  // -B resets/creates the local branch to the fetched head, then checks it out in a new worktree.
-  const add = await git(repo.path, [
-    "worktree",
-    "add",
-    "--track",
-    "-B",
-    headBranch,
-    worktreePath,
-    `origin/${headBranch}`,
-  ]);
-  if (add.code !== 0) {
+    // -B resets/creates the local branch to the fetched head, then checks it out in a new worktree.
+    const add = await git(repo.path, [
+      "worktree",
+      "add",
+      "--track",
+      "-B",
+      headBranch,
+      worktreePath,
+      `origin/${headBranch}`,
+    ]);
+    if (add.code === 0) return false;
+
     // The branch being checked out elsewhere (typically the developer's own working tree) is a
     // deterministic collision — fall back to a DETACHED worktree at the fetched head. Follow-up
     // commits land on the PR branch via a refspec push (HEAD:<branch>), so Milo can still revise
@@ -169,14 +204,13 @@ export async function attachWorktree(
       );
       const detachedAdd = await git(repo.path, ["worktree", "add", "--detach", worktreePath, `origin/${headBranch}`]);
       if (detachedAdd.code !== 0) throw new Error(`Failed to attach worktree: ${detachedAdd.stderr}`);
-      await runSetup(repo, worktreePath, key);
-      return { path: worktreePath, branch: headBranch, baseBranch, detached: true };
+      return true;
     }
     throw new Error(`Failed to attach worktree: ${add.stderr}`);
-  }
+  });
 
   await runSetup(repo, worktreePath, key);
-  return { path: worktreePath, branch: headBranch, baseBranch };
+  return { path: worktreePath, branch: headBranch, baseBranch, detached };
 }
 
 async function runSetup(repo: RepoConfig, worktreePath: string, issueId: string): Promise<void> {
@@ -222,9 +256,11 @@ export async function teardownWorktree(repo: RepoConfig, worktreePath: string): 
     }
   }
   logger.info("Removing worktree");
-  const rm = await git(repo.path, ["worktree", "remove", worktreePath, "--force"]);
-  if (rm.code !== 0) {
-    await run("rm", ["-rf", worktreePath]);
-  }
-  await git(repo.path, ["worktree", "prune"]);
+  await withRepoGitLock(repo.path, async () => {
+    const rm = await git(repo.path, ["worktree", "remove", worktreePath, "--force"]);
+    if (rm.code !== 0) {
+      await run("rm", ["-rf", worktreePath]);
+    }
+    await git(repo.path, ["worktree", "prune"]);
+  });
 }
