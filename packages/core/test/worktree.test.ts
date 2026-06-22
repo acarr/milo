@@ -154,6 +154,20 @@ test("createWorktree keeps the event loop responsive during setup (no spawnSync 
   assert.ok(ticks >= 5, `event loop should keep ticking during setup (got ${ticks})`);
 });
 
+test("concurrent createWorktree on the same repo don't race git's shared ref locks", async () => {
+  const { repo, worktreeBase } = makeRepos();
+  // Two jobs setting up against the SAME clone at once both run `git fetch origin main` + worktree
+  // add. Without per-repo serialization this races ("incorrect old value provided"); the lock lets
+  // both complete. (The setup script is a no-op exit 0, so this exercises just the git critical path.)
+  const [a, b] = await Promise.all([
+    createWorktree(repo, "SBX-c1", "concurrent one", worktreeBase),
+    createWorktree(repo, "SBX-c2", "concurrent two", worktreeBase),
+  ]);
+  assert.notEqual(a.path, b.path);
+  assert.equal(a.baseBranch, "main");
+  assert.equal(b.baseBranch, "main");
+});
+
 test("attachWorktree reuse path reports detached state and resets to the latest head", async () => {
   const { repo, repoPath, worktreeBase } = makeRepos();
   git(repoPath, ["checkout", FEATURE]);
