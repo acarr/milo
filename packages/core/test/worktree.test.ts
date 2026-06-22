@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 process.env["MILO_HOME"] = mkdtempSync(join(os.tmpdir(), "milo-worktree-"));
-import { attachWorktree, isPermanentWorktreeError, ensurePushed, RepoConfigSchema, type RepoConfig } from "@milo/core";
+import { attachWorktree, createWorktree, isPermanentWorktreeError, ensurePushed, RepoConfigSchema, type RepoConfig } from "@milo/core";
 
 const sh = (cmd: string, args: string[], cwd?: string) => {
   const r = spawnSync(cmd, args, { cwd, encoding: "utf8" });
@@ -71,24 +71,24 @@ test("isPermanentWorktreeError classifies deterministic git failures, not flaky 
   assert.equal(isPermanentWorktreeError("error: RPC failed; curl 56 GnuTLS recv error"), false);
 });
 
-test("attachWorktree checks out the PR branch normally when nothing else holds it", () => {
+test("attachWorktree checks out the PR branch normally when nothing else holds it", async () => {
   const { repo, repoPath, worktreeBase } = makeRepos();
   // The dev clone sits on main — the PR branch is free. Delete the local ref so attach recreates it.
   git(repoPath, ["checkout", "main"]);
   git(repoPath, ["branch", "-D", FEATURE]);
 
-  const wt = attachWorktree(repo, "pr-1", FEATURE, "main", worktreeBase);
+  const wt = await attachWorktree(repo, "pr-1", FEATURE, "main", worktreeBase);
   assert.equal(wt.branch, FEATURE);
   assert.ok(!wt.detached, "no collision -> a normal branch checkout, not detached");
   assert.equal(git(wt.path, ["rev-parse", "--abbrev-ref", "HEAD"]), FEATURE);
 });
 
-test("attachWorktree falls back to a detached worktree when the branch is checked out elsewhere", () => {
+test("attachWorktree falls back to a detached worktree when the branch is checked out elsewhere", async () => {
   const { repo, repoPath, worktreeBase } = makeRepos();
   // Collision: the dev clone itself has the PR branch checked out (the MILO-1/PR#2 live incident).
   git(repoPath, ["checkout", FEATURE]);
 
-  const wt = attachWorktree(repo, "pr-2", FEATURE, "main", worktreeBase);
+  const wt = await attachWorktree(repo, "pr-2", FEATURE, "main", worktreeBase);
   assert.equal(wt.detached, true, "collision -> detached fallback");
   assert.equal(wt.branch, FEATURE, "still logically attached to the PR branch");
   // Detached at exactly the PR head.
@@ -104,11 +104,11 @@ test("attachWorktree falls back to a detached worktree when the branch is checke
   assert.equal(git(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]), FEATURE);
 });
 
-test("ensurePushed pushes detached-worktree commits to the PR branch by refspec", () => {
+test("ensurePushed pushes detached-worktree commits to the PR branch by refspec", async () => {
   const { repo, repoPath, origin, worktreeBase } = makeRepos();
   git(repoPath, ["checkout", FEATURE]); // hold the branch -> force detached attach
 
-  const wt = attachWorktree(repo, "pr-3", FEATURE, "main", worktreeBase);
+  const wt = await attachWorktree(repo, "pr-3", FEATURE, "main", worktreeBase);
   assert.equal(wt.detached, true);
 
   // Milo makes a follow-up change in the detached worktree.
@@ -133,15 +133,36 @@ test("ensurePushed pushes detached-worktree commits to the PR branch by refspec"
   assert.equal(git(repoPath, ["rev-parse", "HEAD"]), before);
 });
 
-test("attachWorktree reuse path reports detached state and resets to the latest head", () => {
+test("createWorktree keeps the event loop responsive during setup (no spawnSync stall)", async () => {
+  const { repo, repoPath, worktreeBase } = makeRepos();
+  // A slow setup script stands in for a heavy real one (pnpm install, xcodegen, db seed).
+  const setup = join(repoPath, "setup.sh");
+  writeFileSync(setup, "#!/bin/bash\nsleep 1\nexit 0\n");
+  chmodSync(setup, 0o755);
+
+  // A blocking spawnSync would freeze this timer at 0 for the whole setup; async spawn lets it fire.
+  let ticks = 0;
+  const iv = setInterval(() => {
+    ticks++;
+  }, 50);
+  try {
+    const wt = await createWorktree(repo, "SBX-loop", "loop test", worktreeBase);
+    assert.ok(wt.path, "worktree was created");
+  } finally {
+    clearInterval(iv);
+  }
+  assert.ok(ticks >= 5, `event loop should keep ticking during setup (got ${ticks})`);
+});
+
+test("attachWorktree reuse path reports detached state and resets to the latest head", async () => {
   const { repo, repoPath, worktreeBase } = makeRepos();
   git(repoPath, ["checkout", FEATURE]);
 
-  const first = attachWorktree(repo, "pr-4", FEATURE, "main", worktreeBase);
+  const first = await attachWorktree(repo, "pr-4", FEATURE, "main", worktreeBase);
   assert.equal(first.detached, true);
 
   // Re-attach to the same key (e.g. a second @milo comment) — reuses the worktree.
-  const second = attachWorktree(repo, "pr-4", FEATURE, "main", worktreeBase);
+  const second = await attachWorktree(repo, "pr-4", FEATURE, "main", worktreeBase);
   assert.equal(second.path, first.path);
   assert.equal(second.detached, true, "reuse path reports the worktree is detached");
   assert.equal(git(second.path, ["rev-parse", "HEAD"]), git(repoPath, ["rev-parse", `origin/${FEATURE}`]));

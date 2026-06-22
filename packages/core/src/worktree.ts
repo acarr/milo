@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, copyFileSync, mkdirSync } from "node:fs";
 import { join, isAbsolute } from "node:path";
 import type { RepoConfig } from "./config.js";
@@ -28,20 +28,34 @@ export function isPermanentWorktreeError(message: string): boolean {
   );
 }
 
+/**
+ * Run a child process WITHOUT blocking the event loop. Worktree setup (git fetch, `git worktree
+ * add`, `pnpm install`, repo setup scripts) can take minutes; `spawnSync` would freeze the single
+ * daemon event loop for that whole time — starving the job heartbeat (so the watchdog SIGTERMs a
+ * healthy runner) and the webhook server (so late delegation retries get stale-rejected). `spawn` +
+ * a promise keeps the loop responsive while the child runs.
+ */
 function run(
   cmd: string,
   args: string[],
   opts: { cwd?: string; inherit?: boolean } = {},
-): { code: number; stdout: string; stderr: string } {
-  const r = spawnSync(cmd, args, {
-    cwd: opts.cwd,
-    encoding: "utf8",
-    stdio: opts.inherit ? ["ignore", "inherit", "inherit"] : ["ignore", "pipe", "pipe"],
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      cwd: opts.cwd,
+      stdio: opts.inherit ? ["ignore", "inherit", "inherit"] : ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
+    child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+    // `error` fires when the binary can't be spawned (e.g. ENOENT) — mirror spawnSync's failure shape.
+    child.on("error", (err) => resolve({ code: 1, stdout: stdout.trim(), stderr: (stderr + String(err.message)).trim() }));
+    child.on("close", (code) => resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
   });
-  return { code: r.status ?? 1, stdout: (r.stdout ?? "").trim(), stderr: (r.stderr ?? "").trim() };
 }
 
-function git(repoPath: string, args: string[], inherit = false) {
+function git(repoPath: string, args: string[], inherit = false): Promise<{ code: number; stdout: string; stderr: string }> {
   return run("git", ["-C", repoPath, ...args], { inherit });
 }
 
@@ -65,21 +79,21 @@ export function branchName(issueId: string, title: string): string {
  * blocker's head — instead of the repo's default base, so the dependent's PR stacks on the
  * blocker's. It must be a branch already pushed to `origin`.
  */
-export function createWorktree(
+export async function createWorktree(
   repo: RepoConfig,
   issueId: string,
   title: string,
   worktreeBasePath: string,
   baseOverride?: string,
   branchOverride?: string,
-): Worktree {
+): Promise<Worktree> {
   const worktreePath = join(worktreeBasePath, issueId);
   const branch = branchOverride ?? branchName(issueId, title);
   const base = baseOverride ?? repo.baseBranch;
 
   if (existsSync(join(worktreePath, ".git"))) {
     logger.info({ worktreePath }, "Reusing existing worktree");
-    const dirty = git(worktreePath, ["status", "--short"]).stdout;
+    const dirty = (await git(worktreePath, ["status", "--short"])).stdout;
     if (dirty) logger.warn("Worktree has uncommitted changes");
     return { path: worktreePath, branch, baseBranch: base };
   }
@@ -89,17 +103,17 @@ export function createWorktree(
 
   mkdirSync(worktreeBasePath, { recursive: true });
   logger.info({ branch, base }, "Creating worktree");
-  const fetched = git(repo.path, ["fetch", "origin", base, "--quiet"]);
+  const fetched = await git(repo.path, ["fetch", "origin", base, "--quiet"]);
   if (fetched.code !== 0) throw new Error(`git fetch failed: ${fetched.stderr}`);
 
-  let add = git(repo.path, ["worktree", "add", "-b", branch, worktreePath, `origin/${base}`]);
+  let add = await git(repo.path, ["worktree", "add", "-b", branch, worktreePath, `origin/${base}`]);
   if (add.code !== 0) {
     // Branch may already exist — attach to it.
-    add = git(repo.path, ["worktree", "add", worktreePath, branch]);
+    add = await git(repo.path, ["worktree", "add", worktreePath, branch]);
     if (add.code !== 0) throw new Error(`Failed to create worktree: ${add.stderr}`);
   }
 
-  runSetup(repo, worktreePath, issueId);
+  await runSetup(repo, worktreePath, issueId);
   return { path: worktreePath, branch, baseBranch: base };
 }
 
@@ -108,20 +122,20 @@ export function createWorktree(
  * commits) rather than a fresh feature branch. Same-repo PRs only — cross-repo (fork) heads
  * aren't on `origin` and are rejected by the caller.
  */
-export function attachWorktree(
+export async function attachWorktree(
   repo: RepoConfig,
   key: string,
   headBranch: string,
   baseBranch: string,
   worktreeBasePath: string,
-): Worktree {
+): Promise<Worktree> {
   const worktreePath = join(worktreeBasePath, key);
 
   if (existsSync(join(worktreePath, ".git"))) {
     logger.info({ worktreePath }, "Reusing existing attach worktree");
-    git(worktreePath, ["fetch", "origin", headBranch, "--quiet"]);
-    git(worktreePath, ["reset", "--hard", `origin/${headBranch}`]);
-    const detached = git(worktreePath, ["symbolic-ref", "-q", "HEAD"]).code !== 0;
+    await git(worktreePath, ["fetch", "origin", headBranch, "--quiet"]);
+    await git(worktreePath, ["reset", "--hard", `origin/${headBranch}`]);
+    const detached = (await git(worktreePath, ["symbolic-ref", "-q", "HEAD"])).code !== 0;
     return { path: worktreePath, branch: headBranch, baseBranch, detached };
   }
   if (existsSync(worktreePath)) {
@@ -130,11 +144,11 @@ export function attachWorktree(
 
   mkdirSync(worktreeBasePath, { recursive: true });
   logger.info({ headBranch, baseBranch }, "Attaching worktree to existing PR branch");
-  const fetched = git(repo.path, ["fetch", "origin", headBranch, "--quiet"]);
+  const fetched = await git(repo.path, ["fetch", "origin", headBranch, "--quiet"]);
   if (fetched.code !== 0) throw new Error(`git fetch ${headBranch} failed: ${fetched.stderr}`);
 
   // -B resets/creates the local branch to the fetched head, then checks it out in a new worktree.
-  const add = git(repo.path, [
+  const add = await git(repo.path, [
     "worktree",
     "add",
     "--track",
@@ -153,24 +167,24 @@ export function attachWorktree(
         { headBranch, detail: add.stderr },
         "branch is checked out in another worktree — attaching detached at its head",
       );
-      const detachedAdd = git(repo.path, ["worktree", "add", "--detach", worktreePath, `origin/${headBranch}`]);
+      const detachedAdd = await git(repo.path, ["worktree", "add", "--detach", worktreePath, `origin/${headBranch}`]);
       if (detachedAdd.code !== 0) throw new Error(`Failed to attach worktree: ${detachedAdd.stderr}`);
-      runSetup(repo, worktreePath, key);
+      await runSetup(repo, worktreePath, key);
       return { path: worktreePath, branch: headBranch, baseBranch, detached: true };
     }
     throw new Error(`Failed to attach worktree: ${add.stderr}`);
   }
 
-  runSetup(repo, worktreePath, key);
+  await runSetup(repo, worktreePath, key);
   return { path: worktreePath, branch: headBranch, baseBranch };
 }
 
-function runSetup(repo: RepoConfig, worktreePath: string, issueId: string): void {
+async function runSetup(repo: RepoConfig, worktreePath: string, issueId: string): Promise<void> {
   if (repo.setupScript) {
     const script = isAbsolute(repo.setupScript) ? repo.setupScript : join(repo.path, repo.setupScript);
     if (existsSync(script)) {
       logger.info({ script }, "Running repo setup script");
-      const r = run("bash", [script, worktreePath, `milo-${issueId}`, repo.path, "milo"], {
+      const r = await run("bash", [script, worktreePath, `milo-${issueId}`, repo.path, "milo"], {
         inherit: true,
       });
       if (r.code !== 0) throw new Error(`Setup script failed (exit ${r.code})`);
@@ -189,12 +203,12 @@ function runSetup(repo: RepoConfig, worktreePath: string, issueId: string): void
   }
   const pm = repo.packageManager;
   logger.info({ pm }, "Installing dependencies");
-  const install = run(pm, ["install"], { cwd: worktreePath, inherit: true });
+  const install = await run(pm, ["install"], { cwd: worktreePath, inherit: true });
   if (install.code !== 0) throw new Error(`${pm} install failed (exit ${install.code})`);
 }
 
 /** Tear down a worktree via the repo's teardown script, or `git worktree remove`. */
-export function teardownWorktree(repo: RepoConfig, worktreePath: string): void {
+export async function teardownWorktree(repo: RepoConfig, worktreePath: string): Promise<void> {
   if (!existsSync(worktreePath)) return;
   if (repo.teardownScript) {
     const script = isAbsolute(repo.teardownScript)
@@ -202,15 +216,15 @@ export function teardownWorktree(repo: RepoConfig, worktreePath: string): void {
       : join(repo.path, repo.teardownScript);
     if (existsSync(script)) {
       logger.info("Tearing down worktree via teardown script");
-      const r = run("bash", [script, worktreePath], { inherit: true });
+      const r = await run("bash", [script, worktreePath], { inherit: true });
       if (r.code !== 0) logger.warn(`Teardown script exited ${r.code}`);
       return;
     }
   }
   logger.info("Removing worktree");
-  const rm = git(repo.path, ["worktree", "remove", worktreePath, "--force"]);
+  const rm = await git(repo.path, ["worktree", "remove", worktreePath, "--force"]);
   if (rm.code !== 0) {
-    run("rm", ["-rf", worktreePath]);
+    await run("rm", ["-rf", worktreePath]);
   }
-  git(repo.path, ["worktree", "prune"]);
+  await git(repo.path, ["worktree", "prune"]);
 }
