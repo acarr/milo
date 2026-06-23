@@ -19,6 +19,9 @@ export interface JobIntent {
   repo: string;
   actor?: string;
   rawEventId?: string;
+  /** For Linear agent-session delegations: the raw session id, so the ingest path can post a
+   *  "queued" ack to the chat without parsing it back out of `contentHash`. */
+  sessionId?: string;
 }
 
 /** Map a normalized intent into the store's NewJob shape. */

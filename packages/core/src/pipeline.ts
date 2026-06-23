@@ -78,6 +78,33 @@ function buildSinks(jobId: string, progress?: ProgressStreamer): { onEvent: Runn
   return { onEvent, close: file.close };
 }
 
+/**
+ * Keep a Linear agent session "alive" while a long worktree setup runs: post a best-effort progress
+ * thought every `intervalMs` so Linear doesn't stale the session to "error" during the otherwise
+ * silent setup window. A fast setup (< intervalMs) posts nothing (the first tick is at intervalMs).
+ * No-op when `post` is undefined (no session, or progress disabled). Exported and interval-injectable
+ * so it's unit-testable in isolation.
+ */
+export async function withSetupKeepalive<T>(
+  post: (() => void) | undefined,
+  fn: () => Promise<T>,
+  intervalMs = 30_000,
+): Promise<T> {
+  if (!post) return fn();
+  const iv = setInterval(() => {
+    try {
+      post();
+    } catch {
+      /* best-effort — never let a progress post break setup */
+    }
+  }, intervalMs);
+  try {
+    return await fn();
+  } finally {
+    clearInterval(iv);
+  }
+}
+
 /** Build the function that processes a single claimed job through its full lifecycle. */
 export function makeProcessJob(deps: PipelineDeps) {
   const { config, store, linear, runners, parseResult, echo } = deps;
@@ -248,6 +275,10 @@ export function makeProcessJob(deps: PipelineDeps) {
     const thought = (body: string) => {
       if (sessionId) void linear.agentThought(sessionId, body);
     };
+    // Acknowledge the moment we pick this up, BEFORE the multi-minute setup — otherwise the session
+    // sits silent through setup and Linear stales it to "error". This is the authoritative "started"
+    // signal (it only fires once the job is actually claimed and about to set up).
+    thought("Starting now — setting up an isolated worktree…");
 
     repo = resolveRepo(config, teamKey, issue.labels);
     if (!repo) {
@@ -284,9 +315,14 @@ export function makeProcessJob(deps: PipelineDeps) {
     // this worktree off it so the PRs stack; otherwise base off the repo default.
     const stackedBase = store.stackedBaseFor(job.entityId);
     if (stackedBase) thought(`Stacking on the blocker's branch \`${stackedBase}\` (this PR will target it).`);
+    // Keep the session alive across the (often multi-minute) setup so Linear doesn't stale it.
+    const setupKeepalive =
+      sessionId && resolveProgress(config, repo).enabled ? () => thought("Still preparing the worktree…") : undefined;
     try {
-      worktree = await withHeartbeat(job.id, () =>
-        createWorktree(repo, job.entityId, issue.title, worktreeBase(config.worktreeBase), stackedBase),
+      worktree = await withSetupKeepalive(setupKeepalive, () =>
+        withHeartbeat(job.id, () =>
+          createWorktree(repo, job.entityId, issue.title, worktreeBase(config.worktreeBase), stackedBase),
+        ),
       );
     } catch (err) {
       await failWorktreeSetup(job, repo.name, err as Error, async (msg) => {
@@ -438,6 +474,8 @@ export function makeProcessJob(deps: PipelineDeps) {
     const thought = (body: string) => {
       if (sessionId) void linear.agentThought(sessionId, body);
     };
+    // Acknowledge on pickup, before attaching the branch, so the session doesn't stale to "error".
+    thought("Picked up your follow-up — preparing the branch…");
 
     repo = resolveRepo(config, teamKey, issue.labels);
     if (!repo) {
@@ -464,9 +502,13 @@ export function makeProcessJob(deps: PipelineDeps) {
     // Attach to the ticket's existing branch (a distinct worktree dir from create mode's). When the
     // branch is checked out elsewhere (e.g. the developer's tree), attachWorktree falls back to a
     // detached worktree at its head, so this only throws on real failures.
+    const setupKeepalive =
+      sessionId && resolveProgress(config, repo).enabled ? () => thought("Still preparing the branch…") : undefined;
     try {
-      worktree = await withHeartbeat(job.id, () =>
-        attachWorktree(repo, `${job.entityId}-revise`, prior.branch, prior.baseBranch, worktreeBase(config.worktreeBase)),
+      worktree = await withSetupKeepalive(setupKeepalive, () =>
+        withHeartbeat(job.id, () =>
+          attachWorktree(repo, `${job.entityId}-revise`, prior.branch, prior.baseBranch, worktreeBase(config.worktreeBase)),
+        ),
       );
     } catch (err) {
       await failWorktreeSetup(job, repo.name, err as Error, async (msg) => {

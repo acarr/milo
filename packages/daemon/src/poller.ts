@@ -1,5 +1,6 @@
 import { logger, syncDependencies, dependencyHold, type JobStore, type LinearClient, type MiloConfig } from "@milo/core";
 import { pollLinear, pollGithub, intentToNewJob, type JobIntent } from "@milo/transports";
+import { postQueuedAckIfWaiting } from "./queued-ack.js";
 
 export interface PollerDeps {
   config: MiloConfig;
@@ -17,7 +18,7 @@ export interface PollerDeps {
  * deduped) so the "why didn't it start?" view stays honest. Errors in one source never abort
  * the loop — each transport is isolated.
  */
-function ingest(config: MiloConfig, store: JobStore, source: string, intents: JobIntent[]): number {
+function ingest(config: MiloConfig, store: JobStore, linear: LinearClient, source: string, intents: JobIntent[]): number {
   let created = 0;
   for (const intent of intents) {
     try {
@@ -36,6 +37,8 @@ function ingest(config: MiloConfig, store: JobStore, source: string, intents: Jo
         disposition,
         reason: intent.triggerType,
       });
+      // Tell a delegation it's waiting — but only if it actually will (never claims it has started).
+      postQueuedAckIfWaiting(store, linear, config, intent, disposition);
       if (disposition === "created") {
         created++;
         logger.info({ source, entity: intent.entityRef ?? intent.entityId, jobId: job.id }, "poll enqueued job");
@@ -70,7 +73,7 @@ export function startPolling(deps: PollerDeps): () => void {
     const tick = async () => {
       if (stopped) return;
       try {
-        const created = ingest(config, store, name, await fn());
+        const created = ingest(config, store, linear, name, await fn());
         if (created > 0) logger.info({ transport: name, created }, "poll tick enqueued new work");
         if (after) await after();
       } catch (err) {
@@ -121,8 +124,8 @@ export function startPolling(deps: PollerDeps): () => void {
 /** One-shot poll (for `milo poll`): returns how many new jobs each source enqueued. */
 export async function pollOnce(deps: PollerDeps): Promise<{ linear: number; github: number }> {
   const { config, store, linear } = deps;
-  const linearN = config.transports.linear.enabled === false ? 0 : ingest(config, store, "linear", await pollLinear(linear, config));
-  const githubN = config.transports.github.enabled === false ? 0 : ingest(config, store, "github", await pollGithub(config));
+  const linearN = config.transports.linear.enabled === false ? 0 : ingest(config, store, linear, "linear", await pollLinear(linear, config));
+  const githubN = config.transports.github.enabled === false ? 0 : ingest(config, store, linear, "github", await pollGithub(config));
   // Record/reconcile dependency edges for any work just enqueued (MILO-4).
   await syncDependencies({ config, store, linear });
   return { linear: linearN, github: githubN };

@@ -74,6 +74,7 @@ export async function pollLinear(linear: LinearClient, config: MiloConfig): Prom
         contentHash: `session:${s.sessionId}`, // a new delegation re-triggers
         mode: "create",
         repo: resolveRepo(config, teamKey)?.name ?? teamKey,
+        sessionId: s.sessionId,
       });
     }
   } catch (err) {

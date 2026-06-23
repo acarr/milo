@@ -11,6 +11,7 @@ import {
   type MiloConfig,
 } from "@milo/core";
 import { normalizeLinearWebhook, normalizeGithubWebhook, intentToNewJob, type JobIntent } from "@milo/transports";
+import { postQueuedAckIfWaiting } from "./queued-ack.js";
 
 export interface WebhookDeps {
   config: MiloConfig;
@@ -86,6 +87,8 @@ export function startWebhookServer(deps: WebhookDeps): () => void {
     logger.info({ source: intent.source, entity: intent.entityRef ?? intent.entityId, disposition, jobId: job.id }, "webhook enqueued");
     // Record/reconcile blockedBy edges for the just-enqueued work, then release its hold.
     if (disposition === "created" && intent.source === "linear") syncDeps();
+    // Tell a delegation it's waiting — but only if it actually will (never claims it has started).
+    postQueuedAckIfWaiting(store, linear, config, intent, disposition);
     return 200;
   };
 
