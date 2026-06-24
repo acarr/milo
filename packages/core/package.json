@@ -7,7 +7,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.1",
+    "better-sqlite3": "^12.11.1",
     "croner": "^10.0.1",
     "pino": "^9.6.0",
     "ulid": "^2.3.0",
