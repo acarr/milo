@@ -1,5 +1,6 @@
 export * from "./paths.js";
 export * from "./config.js";
+export * from "./secrets.js";
 export * from "./logger.js";
 export * from "./store.js";
 export * from "./linear.js";

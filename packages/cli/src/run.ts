@@ -18,7 +18,7 @@ import {
   TERMINAL_STATES,
   type PersistedEvent,
 } from "@milo/core";
-import { runClaude, runCodex, parseRunnerResult } from "@milo/runners";
+import { runClaude, runCodex, makeConductorRunner, parseRunnerResult } from "@milo/runners";
 import { createClient, type JobsFilter } from "./viewmodel.js";
 
 /**
@@ -63,7 +63,7 @@ export async function runIssues(issueIds: string[]): Promise<number> {
     config,
     store,
     linear,
-    runners: { claude: runClaude, codex: runCodex },
+    runners: { claude: runClaude, codex: runCodex, conductor: makeConductorRunner(config) },
     parseResult: parseRunnerResult,
     // single issue: stream to the terminal; many: keep stdout clean, use per-job logs + `milo jobs`
     echo: issueIds.length === 1 ? process.stdout : undefined,
@@ -121,12 +121,13 @@ const STATE_COLOR: Record<string, string> = {
   abandoned: "\x1b[31m",
   cancelled: "\x1b[90m",
   running: "\x1b[36m",
+  "remote-waiting": "\x1b[36m",
   queued: "\x1b[33m",
 };
 const RESET = "\x1b[0m";
 
 const STATE_ORDER = [
-  "queued", "claimed", "setting-up", "running", "verifying", "remediating", "reporting",
+  "queued", "claimed", "setting-up", "running", "remote-waiting", "verifying", "remediating", "reporting",
   "done", "discovery-done", "retrying", "failed", "needs-attention", "cancelled", "abandoned",
 ];
 
@@ -542,7 +543,7 @@ export async function runPrompt(name: string): Promise<number> {
     config,
     store,
     linear,
-    runners: { claude: runClaude, codex: runCodex },
+    runners: { claude: runClaude, codex: runCodex, conductor: makeConductorRunner(config) },
     parseResult: parseRunnerResult,
     echo: process.stdout,
   });
@@ -639,6 +640,7 @@ export function showJob(jobId: string, json: boolean): number {
   console.log(`  repo:     ${job.repo}${job.branch ? `  branch ${job.branch}` : ""}`);
   console.log(`  runner:   ${job.runner ?? "-"}${job.model ? ` (${job.model})` : ""}  attempts ${job.attempts}/${job.maxAttempts}`);
   if (job.prUrl) console.log(`  pr:       ${job.prUrl}`);
+  if (job.remoteUrl) console.log(`  session:  ${job.remoteUrl}`);
   if (job.summary) console.log(`  summary:  ${job.summary}`);
   if (job.failureDetail) console.log(`  failure:  ${job.failureClass ?? ""} ${job.failureDetail}`);
   if (dependencies.length) {

@@ -134,3 +134,18 @@ is a planned hardening — see `docs/REMAINING-WORK.md` B4.)
 
 See [reliability.md](./reliability.md) for the verification gate and circuit breaker in depth, and
 [database.md](./database.md) for the columns each transition writes.
+
+---
+
+## `remote-waiting` — parked on an off-machine session
+
+A job run by the **Conductor** runner splits its lifecycle: it dispatches the cloud session, then
+transitions to `remote-waiting` and returns, which frees its local concurrency slot. The daemon's
+remote tracker later resumes it and runs the ordinary verification tail.
+
+```
+claimed → setting-up → running → remote-waiting → verifying → [remediating] → reporting → done
+```
+
+`remote-waiting` is non-terminal and holds the **per-entity lock** but **not** a local slot. See
+[conductor.md](./conductor.md#concurrency--parking).

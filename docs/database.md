@@ -24,7 +24,7 @@ One row per unit of work. Primary key `id`; **unique** on `identity_key`.
 | `content_hash` | TEXT | Dedup component (timestamp-bearing for re-triggerable work). |
 | `state` | TEXT | Job state (see [job-lifecycle.md](./job-lifecycle.md)). |
 | `mode` | TEXT | `create` \| `attach` (default `create`). |
-| `runner` | TEXT | `claude` \| `codex` \| null. |
+| `runner` | TEXT | `claude` \| `codex` \| `conductor` \| null. |
 | `model` | TEXT | e.g. `opus`, `gpt-5.5`. |
 | `repo` | TEXT | Repo name from config. |
 | `worktree_path` | TEXT | Absolute worktree path. |
@@ -45,6 +45,11 @@ One row per unit of work. Primary key `id`; **unique** on `identity_key`.
 | `failure_class` | TEXT | `transient-infra`, `runner-crash`, `no-pr`, `wrong-outcome`, `unexpected`, `breaker`, `logic`. |
 | `failure_detail` | TEXT | Human-readable error. |
 | `summary` | TEXT | Runner summary (posted back). |
+| `remote_provider` | TEXT | `conductor` when the work ran off-machine, else null. |
+| `remote_workspace_id` / `remote_session_id` | TEXT | The remote workspace + session. Present so a daemon restart **reattaches** instead of dispatching a duplicate cloud workspace. |
+| `remote_url` | TEXT | Deep link to the remote workspace — the "where is my work" answer. |
+| `remote_cursor` | TEXT | Last consumed remote transcript message id, so a resume doesn't re-emit history. |
+| `remote_saw_working` | INTEGER | Whether the remote session was ever observed `working`. **Correctness state:** a queued Conductor prompt reports `idle` until its turn starts, so without this latch a resumed job would read that `idle` as "finished". |
 | `created_at` / `updated_at` / `terminal_at` | INTEGER | Epoch ms timestamps. |
 
 **Indexes:** `idx_jobs_state(state)`, `idx_jobs_entity(entity_id)`,
@@ -165,7 +170,17 @@ blockers finish, merge, fail, or vanish.
 
 ## `schema_meta` — versioning
 
-`key TEXT PK, value TEXT` — holds the schema version.
+`key TEXT PK, value TEXT` — holds the schema version (currently **5**).
+
+Migrations are **idempotent and additive**: every column is declared in `SCHEMA` (so a fresh DB gets it)
+*and* added via a `PRAGMA table_info(jobs)`-guarded `ALTER TABLE` (so an existing DB catches up). There
+is no down-migration.
+
+| Version | Added |
+|---------|-------|
+| 3 | `events_log`, `runner_log` |
+| 4 | `cancel_requested`, `cancel_requested_at`, terminal state `cancelled` |
+| 5 | `remote_provider`, `remote_workspace_id`, `remote_session_id`, `remote_url`, `remote_cursor`, `remote_saw_working` (Conductor Cloud) |
 
 ---
 

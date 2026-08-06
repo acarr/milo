@@ -9,7 +9,7 @@ import { configPath, MiloConfigSchema, type MiloConfig } from "@milo/core";
 export interface InitConfigInput {
   /** Only written when it differs from the $MILO_HOME/worktrees default. */
   worktreeBase?: string;
-  defaultRunner?: "claude" | "codex";
+  defaultRunner?: "claude" | "codex" | "conductor";
   enableWebhook?: boolean;
   autoMerge?: boolean;
   linearClientId?: string;
@@ -78,7 +78,7 @@ export function writeBaseConfig(input: InitConfigInput, path = configPath()): Mi
  * file is touched.
  */
 export interface SettingsPatch {
-  defaultRunner?: "claude" | "codex";
+  defaultRunner?: "claude" | "codex" | "conductor";
   webhookEnabled?: boolean;
   autoMerge?: boolean;
   concurrency?: number;

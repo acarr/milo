@@ -23,6 +23,7 @@ export function JobDetailView({ detail }: { detail: JobDetail }) {
         {hasTranscript ? " · transcript ✓ (press t)" : ""}
       </Text>
       {job.prUrl ? <Text color="green">{job.prUrl}</Text> : null}
+      {job.remoteUrl ? <Text color="cyan">{job.remoteUrl}</Text> : null}
       {job.summary ? (
         <Box marginTop={1}>
           <Text>{job.summary}</Text>

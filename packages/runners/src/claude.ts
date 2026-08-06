@@ -3,6 +3,7 @@ import { createWriteStream, mkdirSync } from "node:fs";
 import { dirname, delimiter } from "node:path";
 import type { RunnerEvent, RunnerEventSink } from "@milo/core";
 import { RunGuards, onAbortKill, type GuardTimeouts } from "./guards.js";
+import { mapStreamJsonEvent } from "./stream-json.js";
 
 export interface ClaudeRunOptions {
   cwd: string;
@@ -45,44 +46,6 @@ function cleanEnv(): NodeJS.ProcessEnv {
   for (const p of extra) if (!parts.includes(p)) parts.unshift(p);
   env["PATH"] = parts.join(delimiter);
   return env;
-}
-
-const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit", "Update"]);
-
-/** Translate a Claude `tool_use` block into a normalized progress event. */
-function toolEvent(name: string, input: Record<string, unknown>): RunnerEvent {
-  const kind = FILE_TOOLS.has(name) ? "file-change" : "tool";
-  const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : "");
-  let text: string;
-  switch (name) {
-    case "Edit":
-    case "Write":
-    case "MultiEdit":
-    case "Update":
-      text = `${name} ${str("file_path") || str("path")}`.trim();
-      break;
-    case "NotebookEdit":
-      text = `NotebookEdit ${str("notebook_path")}`.trim();
-      break;
-    case "Bash":
-      text = `$ ${str("command")}`.trim();
-      break;
-    case "Read":
-      text = `Read ${str("file_path")}`.trim();
-      break;
-    case "Grep":
-      text = `Grep ${str("pattern")}`.trim();
-      break;
-    case "Glob":
-      text = `Glob ${str("pattern")}`.trim();
-      break;
-    case "Task":
-      text = `Task: ${str("description")}`.trim();
-      break;
-    default:
-      text = name;
-  }
-  return { kind, tool: name, text };
 }
 
 /**
@@ -166,27 +129,20 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
         appendText(line);
         return;
       }
-      try {
-        if (evt.type === "assistant" && evt.message?.content) {
-          for (const block of evt.message.content as any[]) {
-            if (block.type === "text" && typeof block.text === "string") {
-              appendText(block.text);
-              emit({ kind: "narration", text: block.text });
-            } else if (block.type === "tool_use" && typeof block.name === "string") {
-              const e = toolEvent(block.name, (block.input ?? {}) as Record<string, unknown>);
-              emit(e);
-              opts.echo?.write(`• ${e.text}\n`);
-            }
-          }
-        } else if (evt.type === "result" && typeof evt.result === "string") {
+      for (const item of mapStreamJsonEvent(evt)) {
+        if (item.kind === "text") {
+          appendText(item.text);
+          emit({ kind: "narration", text: item.text });
+        } else if (item.kind === "event") {
+          emit(item.event);
+          opts.echo?.write(`• ${item.event.text}\n`);
+        } else {
           // The final result text carries MILO_RESULT — keep it in `output` for the parser.
-          output += (output.endsWith("\n") ? "" : "\n") + evt.result + "\n";
-          if (evt.is_error) emit({ kind: "notice", text: `Run reported an error: ${evt.result}` });
+          output += (output.endsWith("\n") ? "" : "\n") + item.text + "\n";
+          if (item.isError) emit({ kind: "notice", text: `Run reported an error: ${item.text}` });
           // The work is done; if the CLI lingers (MCP children holding it open), the guard kills it.
           guards.sawResult();
         }
-      } catch {
-        /* tolerate any unexpected event shape */
       }
     };
 

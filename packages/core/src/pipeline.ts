@@ -6,14 +6,59 @@ import type { RunnerEventSink } from "./runner-events.js";
 import type { JobStore, Job } from "./jobs.js";
 import { LinearClient, type LinearIssue } from "./linear.js";
 import { createWorktree, attachWorktree, teardownWorktree, isPermanentWorktreeError, type Worktree } from "./worktree.js";
-import { buildPrompt, buildFreeformPrompt, buildAttachPrompt, buildLinearAttachPrompt } from "./prompt.js";
+import {
+  buildPrompt,
+  buildFreeformPrompt,
+  buildAttachPrompt,
+  buildLinearAttachPrompt,
+  buildConductorPrompt,
+} from "./prompt.js";
 import { resolveGroundTruth, ensurePr, ensurePushed } from "./verify.js";
-import { resolveRunner, modelFor, resolveRepoByGithub, type RunnerId } from "./router.js";
-import { fetchPr, prComments, addPrComment, type PullRequest } from "./github.js";
+import { resolveRunner, modelFor, resolveRepoByGithub, isRemoteRunner, type RunnerId } from "./router.js";
+import { fetchPr, prComments, addPrComment, githubSlugForPath, type PullRequest } from "./github.js";
 import { worktreeBase } from "./paths.js";
 import { logsDir } from "./paths.js";
 import { logger } from "./logger.js";
 import { join } from "node:path";
+
+/**
+ * Job/worktree context a runner may need beyond the prompt itself.
+ *
+ * Local runners ignore this — they work in `cwd` and the gate reads whatever they left there. A
+ * REMOTE runner can't: it has to be told the branch to push (the cross-boundary contract) and where
+ * to persist its remote session, and neither is derivable from `cwd` (a detached worktree reports
+ * `HEAD` for its branch, and the base branch isn't recoverable from a worktree at all).
+ */
+export interface RunnerContext {
+  jobId: string;
+  ref: string;
+  repoName: string;
+  /** `owner/name`, when resolvable. */
+  repoSlug?: string;
+  branch: string;
+  baseBranch: string;
+  detached?: boolean;
+  /** A previously-started remote session to resume instead of starting a new one. */
+  remoteSession?: RemoteSession;
+  /** Persist remote session state as soon as it exists, so a crash resumes rather than duplicates. */
+  onRemoteSession?: (session: RemoteSession) => void;
+  /**
+   * Split a remote run so the local concurrency slot isn't held for the whole session:
+   * `dispatch` starts it and returns; `track` reattaches and waits. Omit for all-in-one.
+   */
+  remotePhase?: "dispatch" | "track";
+  /** Liveness ping while tracking a parked job — proves the tracker hasn't died. */
+  onRemotePoll?: () => void;
+}
+
+/** Durable pointer to work happening on another machine. */
+export interface RemoteSession {
+  workspaceId: string;
+  sessionId: string;
+  deepLink: string;
+  cursor?: string;
+  sawWorking?: boolean;
+}
 
 /** A runner invocation, injected so core stays independent of @milo/runners. */
 export interface RunnerFn {
@@ -28,6 +73,8 @@ export interface RunnerFn {
     onEvent?: RunnerEventSink;
     /** Abort the run (user-initiated cancel) — the runner kills its whole process group. */
     signal?: AbortSignal;
+    /** Optional — existing runners and their tests are unaffected. */
+    context?: RunnerContext;
   }): Promise<{ code: number; output: string; logFile: string }>;
 }
 
@@ -36,6 +83,15 @@ export interface RunnerResultLike {
   wroteCode: boolean;
   prUrl: string | null;
   summary: string;
+}
+
+/**
+ * What `makeProcessJob` returns: the queue's per-job entry point, plus `resumeRemote` for jobs
+ * parked on an off-machine session (driven by the daemon's remote tracker, not the queue).
+ */
+export interface ProcessJobFn {
+  (job: Job): Promise<void>;
+  resumeRemote: (job: Job) => Promise<void>;
 }
 
 export interface PipelineDeps {
@@ -61,6 +117,29 @@ function routingInstruction(repo: RepoConfig, issue: LinearIssue): string {
 function logFilePath(ref: string): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return join(logsDir(), `${ref.replace(/[^A-Za-z0-9._-]/g, "_")}-${stamp}.log`);
+}
+
+/**
+ * Preconditions a remote (Conductor) run needs that a local one doesn't. Returns a human-readable
+ * reason when the repo can't be run remotely, or undefined when it can.
+ *
+ * `githubRepo` is optional in config (it opts a repo into GitHub PR polling), but a remote run is
+ * defined entirely in terms of a GitHub branch, so here it is load-bearing.
+ */
+function remotePreconditions(repo: RepoConfig): string | undefined {
+  const slug = repo.githubRepo ?? githubSlugForPath(repo.path);
+  if (!slug) {
+    return `Repo "${repo.name}" needs \`githubRepo: "owner/name"\` in config to run on Conductor Cloud (Milo verifies remote work through GitHub).`;
+  }
+  if (!repo.conductor?.projectId && !repo.conductor?.repositoryUrl) {
+    // Not fatal on its own — the runner falls back to repositoryUrl — but an organization API key
+    // rejects a repo that hasn't been added to the org's machine, so say so plainly up front.
+    logger.warn(
+      { repo: repo.name },
+      "conductor: no projectId configured — falling back to repositoryUrl, which organization API keys reject for repos not on the org machine",
+    );
+  }
+  return undefined;
 }
 
 /**
@@ -108,6 +187,40 @@ export async function withSetupKeepalive<T>(
 /** Build the function that processes a single claimed job through its full lifecycle. */
 export function makeProcessJob(deps: PipelineDeps) {
   const { config, store, linear, runners, parseResult, echo } = deps;
+
+  /** The remote session already recorded for this job, if any (drives resume-vs-dispatch). */
+  const remoteSessionFor = (job: Job): RemoteSession | undefined => {
+    const fresh = store.get(job.id) ?? job;
+    if (!fresh.remoteWorkspaceId || !fresh.remoteSessionId) return undefined;
+    return {
+      workspaceId: fresh.remoteWorkspaceId,
+      sessionId: fresh.remoteSessionId,
+      deepLink: fresh.remoteUrl ?? "",
+      cursor: fresh.remoteCursor ?? undefined,
+      sawWorking: fresh.remoteSawWorking,
+    };
+  };
+
+  /**
+   * Persist a remote session as soon as the runner reports one. Deliberately synchronous and
+   * called BEFORE the prompt is sent: the window between "cloud workspace exists" and "Milo knows
+   * about it" is exactly the window in which a crash orphans a workspace and a restart creates a
+   * second one.
+   */
+  const persistRemoteSession = (jobId: string, s: RemoteSession): void => {
+    try {
+      store.transition(jobId, "running", {
+        remote_provider: "conductor",
+        remote_workspace_id: s.workspaceId,
+        remote_session_id: s.sessionId,
+        remote_url: s.deepLink,
+        remote_cursor: s.cursor ?? null,
+        remote_saw_working: s.sawWorking ? 1 : 0,
+      });
+    } catch (err) {
+      logger.warn({ jobId, err: (err as Error).message }, "could not persist remote session");
+    }
+  };
 
   const fail = (job: Job, failureClass: string, detail: string, teardown?: () => void) => {
     const attempt = job.attempts; // attempts already reflects this run's count baseline
@@ -309,7 +422,20 @@ export function makeProcessJob(deps: PipelineDeps) {
       });
       return;
     }
-    const model = modelFor(config, runnerId);
+    const model = modelFor(config, runnerId, repo);
+    const remote = isRemoteRunner(runnerId);
+
+    // A remote run's whole contract is "push this branch to this GitHub repo", and the agent is
+    // told the slug explicitly. Without one there is nothing to hand it — fail before spending a
+    // cloud workspace on a run that cannot be verified.
+    if (remote) {
+      const gate = remotePreconditions(repo);
+      if (gate) {
+        if (sessionId) await linear.agentError(sessionId, gate);
+        store.transition(job.id, "needs-attention", { failure_class: "logic", failure_detail: gate });
+        return;
+      }
+    }
 
     // Stacked dependency (MILO-4): if a resolved `stacked` blocker recorded its head branch, base
     // this worktree off it so the PRs stack; otherwise base off the repo default.
@@ -321,7 +447,12 @@ export function makeProcessJob(deps: PipelineDeps) {
     try {
       worktree = await withSetupKeepalive(setupKeepalive, () =>
         withHeartbeat(job.id, () =>
-          createWorktree(repo, job.entityId, issue.title, worktreeBase(config.worktreeBase), stackedBase),
+          // A remote run never touches this worktree — it exists only as the git/gh working
+          // directory for the verification gate — so installing dependencies here is pure waste
+          // (and would hard-fail any repo whose setupScript needs docker).
+          createWorktree(repo, job.entityId, issue.title, worktreeBase(config.worktreeBase), stackedBase, undefined, {
+            skipSetup: remote,
+          }),
         ),
       );
     } catch (err) {
@@ -348,10 +479,24 @@ export function makeProcessJob(deps: PipelineDeps) {
     } catch {
       /* non-fatal */
     }
-    thought(`Set up an isolated worktree on \`${worktree.branch}\` and started work with ${runnerId} (${model}).`);
+    const repoSlug = repo.githubRepo ?? githubSlugForPath(repo.path) ?? undefined;
+    thought(
+      remote
+        ? `Handing this to a Conductor Cloud workspace on \`${worktree.branch}\` (${model}).`
+        : `Set up an isolated worktree on \`${worktree.branch}\` and started work with ${runnerId} (${model}).`,
+    );
 
     const augment = [config.promptAugmentation.global, repo.promptAugmentation].filter(Boolean).join("\n\n");
-    const prompt = buildPrompt({ repo, worktree, issue, routingInstruction: routingInstruction(repo, issue) });
+    const prompt = remote
+      ? buildConductorPrompt({
+          repo,
+          issue,
+          routingInstruction: routingInstruction(repo, issue),
+          branch: worktree.branch,
+          baseBranch: worktree.baseBranch,
+          githubRepo: repoSlug!, // guaranteed by the remote precondition check above
+        })
+      : buildPrompt({ repo, worktree, issue, routingInstruction: routingInstruction(repo, issue) });
     store.heartbeat(job.id);
 
     // Phase C: only stream live progress when the issue was delegated to the agent (has a session).
@@ -379,12 +524,69 @@ export function makeProcessJob(deps: PipelineDeps) {
         logFile,
         echo,
         onEvent: sinks.onEvent,
+        context: {
+          jobId: job.id,
+          ref,
+          repoName: repo.name,
+          repoSlug,
+          branch: worktree.branch,
+          baseBranch: worktree.baseBranch,
+          detached: worktree.detached,
+          remoteSession: remoteSessionFor(job),
+          onRemoteSession: (s) => persistRemoteSession(job.id, s),
+          // Dispatch and return, so the local slot isn't held for the whole remote session.
+          remotePhase: remote ? "dispatch" : undefined,
+        },
       },
       runner,
     );
     sinks.close();
     // Flush any buffered progress and stop before the terminal response so it always lands last.
     await progress?.stop();
+
+    // Remote dispatch succeeded: the cloud session is live and its ids are persisted. Park the job
+    // and RETURN — the queue's cap is in-process `inFlight` accounting, so returning here frees the
+    // local slot while the (possibly hour-long) remote work continues. A tracker resumes it.
+    if (remote && run.code === 0 && !cancelled && store.get(job.id)?.remoteSessionId) {
+      store.parkOnRemote(job.id);
+      thought("Working in a Conductor Cloud workspace — I'll report back when it finishes.");
+      logger.info({ jobId: job.id, entity: job.entityId }, "parked on remote session (slot released)");
+      return;
+    }
+
+    await finalizeCreateRun({
+      job,
+      repo,
+      worktree,
+      issue,
+      teamKey,
+      sessionId,
+      thought,
+      ref,
+      run,
+      cancelled,
+    });
+  }
+
+  /**
+   * The tail every create-mode run shares: cancel handling → parse → verification gate → PR →
+   * report → terminal state. Extracted so a LOCAL run (which reaches it inline) and a REMOTE run
+   * (which reaches it later, from the tracker, after being parked) cannot drift apart.
+   */
+  async function finalizeCreateRun(i: {
+    job: Job;
+    repo: RepoConfig;
+    worktree: Worktree;
+    issue: LinearIssue;
+    teamKey: string;
+    sessionId: string | undefined;
+    thought: (body: string) => void;
+    ref: string;
+    run: { code: number; output: string };
+    cancelled: boolean;
+  }): Promise<void> {
+    const { job, repo, worktree, issue, teamKey, sessionId, thought, ref, run, cancelled } = i;
+
     if (cancelled) {
       await finalizeCancelled(job, repo, worktree.path, async () => {
         if (sessionId) await linear.agentError(sessionId, "Milo cancelled this run.");
@@ -446,8 +648,92 @@ export function makeProcessJob(deps: PipelineDeps) {
       else await linear.agentError(sessionId, `Milo couldn't complete this: ${detail}.`);
     }
     fail(job, run.code !== 0 ? "runner-crash" : "wrong-outcome", detail, () =>
-      teardownIfNeeded(repo!, worktree!.path, false, true),
+      teardownIfNeeded(repo, worktree.path, false, true),
     );
+  }
+
+  /**
+   * Resume a job parked on a remote session: reattach, poll it to completion, then run the same
+   * verification tail a local run would. Driven by the daemon's remote tracker, which has its own
+   * concurrency cap so waiting on the cloud never starves local work.
+   */
+  async function resumeRemoteJob(job: Job): Promise<void> {
+    const ref = job.entityRef ?? job.entityId;
+    const teamKey = job.entityId.split("-")[0]!;
+    const repo = resolveRepoByName(config, job.repo);
+    const session = remoteSessionFor(job);
+
+    if (!repo || !job.worktreePath || !job.branch || !session) {
+      store.transition(job.id, "needs-attention", {
+        failure_class: "logic",
+        failure_detail: "parked remote job is missing its repo/worktree/session",
+      });
+      return;
+    }
+
+    const runner = selectRunner((job.runner as RunnerId) ?? "conductor");
+    if (!runner) {
+      store.transition(job.id, "needs-attention", {
+        failure_class: "logic",
+        failure_detail: `runner "${job.runner}" is not registered`,
+      });
+      return;
+    }
+
+    const issue = await linear.fetchIssue(job.entityId);
+    const sessionId = await linear.agentSessionForIssue(job.entityId).catch(() => undefined);
+    const thought = (body: string) => {
+      if (sessionId) void linear.agentThought(sessionId, body);
+    };
+    const worktree: Worktree = {
+      path: job.worktreePath,
+      branch: job.branch,
+      baseBranch: job.baseBranch ?? repo.baseBranch,
+    };
+
+    const progressCfg = resolveProgress(config, repo);
+    const progress =
+      sessionId && progressCfg.enabled
+        ? new ProgressStreamer(
+            {
+              thought: (body) => linear.agentThought(sessionId, body),
+              action: (action, parameter, result) => linear.agentAction(sessionId, action, parameter, result),
+            },
+            { enabled: true, verbosity: progressCfg.verbosity, minIntervalMs: progressCfg.minIntervalMs },
+          )
+        : undefined;
+
+    const sinks = buildSinks(job.id, progress);
+    const { run, cancelled } = await runWithCancel(
+      job,
+      {
+        cwd: worktree.path,
+        prompt: "", // the prompt was delivered at dispatch; this phase only tracks
+        model: job.model ?? "",
+        logFile: job.runnerLog ?? logFilePath(ref),
+        echo,
+        onEvent: sinks.onEvent,
+        context: {
+          jobId: job.id,
+          ref,
+          repoName: repo.name,
+          repoSlug: repo.githubRepo ?? githubSlugForPath(repo.path) ?? undefined,
+          branch: worktree.branch,
+          baseBranch: worktree.baseBranch,
+          detached: worktree.detached,
+          remoteSession: session,
+          onRemoteSession: (s) => persistRemoteSession(job.id, s),
+          remotePhase: "track",
+          // Prove the tracker is alive; a parked job holds no worker lease for the watchdog to see.
+          onRemotePoll: () => store.remotePoll(job.id),
+        },
+      },
+      runner,
+    );
+    sinks.close();
+    await progress?.stop();
+
+    await finalizeCreateRun({ job, repo, worktree, issue, teamKey, sessionId, thought, ref, run, cancelled });
   }
 
   // ---------------------------------------------------------------- Linear (revise existing PR)
@@ -854,7 +1140,7 @@ export function makeProcessJob(deps: PipelineDeps) {
 
   // ---------------------------------------------------------------- dispatch
 
-  return async function processJob(job: Job): Promise<void> {
+  const processJob = async function processJob(job: Job): Promise<void> {
     try {
       // Heartbeat for the whole active lifecycle so the lease only expires if processing truly dies.
       await withHeartbeat(job.id, () => {
@@ -870,7 +1156,28 @@ export function makeProcessJob(deps: PipelineDeps) {
       logger.error({ jobId: job.id, err: (err as Error).message }, "pipeline error");
       fail(job, "unexpected", (err as Error).message);
     }
+  } as ProcessJobFn;
+
+  /**
+   * Continue a job parked on a remote session. Separate from `processJob` because it must NOT be
+   * re-dispatched through the main queue — the whole point is that it doesn't consume a local slot.
+   * The daemon's remote tracker drives this under its own cap.
+   */
+  processJob.resumeRemote = async (job: Job): Promise<void> => {
+    try {
+      await resumeRemoteJob(job);
+    } catch (err) {
+      const detail = (err as Error).message;
+      // The tick failed, but the cloud session is almost certainly still working (this fires for
+      // things like a Linear API blip while fetching the issue). Keep the job parked WITH its
+      // session so the next tracker tick reattaches — never requeue, which would dispatch a second
+      // workspace and abandon the one doing the work.
+      const outcome = store.retryRemoteTracking(job.id, "transient-infra", detail);
+      logger.warn({ jobId: job.id, err: detail, outcome }, "remote resume tick failed");
+    }
   };
+
+  return processJob;
 
   // ---------------------------------------------------------------- reporting
 

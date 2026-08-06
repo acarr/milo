@@ -43,6 +43,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   failure_class       TEXT,
   failure_detail      TEXT,
   summary             TEXT,
+  -- v5: remote-runner session pointers (Conductor Cloud). Present so a daemon restart RESUMES the
+  -- work already running off-machine instead of dispatching a duplicate cloud workspace.
+  remote_provider     TEXT,
+  remote_workspace_id TEXT,
+  remote_session_id   TEXT,
+  remote_url          TEXT,
+  remote_cursor       TEXT,
+  remote_saw_working  INTEGER,
+  remote_polled_at    INTEGER,
   created_at          INTEGER NOT NULL,
   updated_at          INTEGER NOT NULL,
   terminal_at         INTEGER
@@ -144,10 +153,22 @@ export function openDatabase(path = dbPath()): DB {
   // would race the pipeline's own running→verifying→… transitions).
   if (!jobCols.has("cancel_requested")) db.exec("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
   if (!jobCols.has("cancel_requested_at")) db.exec("ALTER TABLE jobs ADD COLUMN cancel_requested_at INTEGER");
+  // v5: remote-runner session pointers. `recoverOnStartup` requeues in-flight jobs on daemon start,
+  // which for a remote job must mean "reattach to the workspace already doing the work", not "start
+  // a second one" — these columns are what make that distinction possible.
+  if (!jobCols.has("remote_provider")) db.exec("ALTER TABLE jobs ADD COLUMN remote_provider TEXT");
+  if (!jobCols.has("remote_workspace_id")) db.exec("ALTER TABLE jobs ADD COLUMN remote_workspace_id TEXT");
+  if (!jobCols.has("remote_session_id")) db.exec("ALTER TABLE jobs ADD COLUMN remote_session_id TEXT");
+  if (!jobCols.has("remote_url")) db.exec("ALTER TABLE jobs ADD COLUMN remote_url TEXT");
+  if (!jobCols.has("remote_cursor")) db.exec("ALTER TABLE jobs ADD COLUMN remote_cursor TEXT");
+  if (!jobCols.has("remote_saw_working")) db.exec("ALTER TABLE jobs ADD COLUMN remote_saw_working INTEGER");
+  // Liveness for a PARKED remote job: it holds no worker lease for hours at a time, so the
+  // ordinary lease watchdog cannot see it. This is what `reclaimStalledRemote` keys on.
+  if (!jobCols.has("remote_polled_at")) db.exec("ALTER TABLE jobs ADD COLUMN remote_polled_at INTEGER");
   // Created here (not in SCHEMA) so the next_eligible_at column exists first on migrated databases.
   db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_eligible ON jobs(state, next_eligible_at)");
   db.prepare(
-    "INSERT INTO schema_meta(key, value) VALUES('schema_version', '4') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    "INSERT INTO schema_meta(key, value) VALUES('schema_version', '5') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
   ).run();
   return db;
 }

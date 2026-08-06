@@ -7,6 +7,7 @@ export type JobState =
   | "claimed"
   | "setting-up"
   | "running"
+  | "remote-waiting"
   | "verifying"
   | "remediating"
   | "reporting"
@@ -27,8 +28,13 @@ export const TERMINAL_STATES: JobState[] = [
   "abandoned",
 ];
 
-/** States in which a job is actively held by a worker (occupies a concurrency slot / entity lock). */
-export const ACTIVE_STATES: JobState[] = [
+/**
+ * States that consume a **local concurrency slot** — i.e. a worker on this machine is actively
+ * doing something. Note this deliberately EXCLUDES `remote-waiting`: a job parked on a Conductor
+ * Cloud session is using no local CPU, disk, or process, so holding one of the (default 3) local
+ * slots for the hour it takes would starve real local work.
+ */
+export const SLOT_STATES: JobState[] = [
   "claimed",
   "setting-up",
   "running",
@@ -36,6 +42,19 @@ export const ACTIVE_STATES: JobState[] = [
   "remediating",
   "reporting",
 ];
+
+/**
+ * States that hold the **per-entity lock** — a superset of {@link SLOT_STATES}. A job parked on a
+ * remote session still owns its ticket: a second delegation for the same issue must not spin up a
+ * second cloud workspace just because the first one is waiting rather than working.
+ */
+export const ENTITY_LOCK_STATES: JobState[] = [...SLOT_STATES, "remote-waiting"];
+
+/**
+ * Every non-terminal, in-flight state. Kept as the historical name so TUI/CLI "active" filters keep
+ * meaning "this job is in flight", which is what a human expects to see.
+ */
+export const ACTIVE_STATES: JobState[] = ENTITY_LOCK_STATES;
 
 export type JobSource = "linear" | "github" | "schedule" | "cli" | "prompt";
 
@@ -106,6 +125,22 @@ export interface Job {
   /** Out-of-band cancel signal: set true by the CLI/TUI, polled by the running worker. */
   cancelRequested: boolean;
   cancelRequestedAt: number | null;
+  /** Remote-runner session pointers (`conductor`). Null for local runs. */
+  remoteProvider: string | null;
+  remoteWorkspaceId: string | null;
+  remoteSessionId: string | null;
+  /** Deep link to the remote workspace — the "where is my work" answer for a human. */
+  remoteUrl: string | null;
+  /** Last consumed remote transcript message id, so a resume doesn't re-emit history. */
+  remoteCursor: string | null;
+  /**
+   * Whether the remote session was ever observed `working`. Correctness state, not cosmetics: a
+   * queued Conductor prompt reports `idle` until its turn starts, so without this latch a resumed
+   * job would see that `idle` and wrongly conclude the run had finished.
+   */
+  remoteSawWorking: boolean;
+  /** Last tracker poll of a parked remote job — the liveness signal for `reclaimStalledRemote`. */
+  remotePolledAt: number | null;
   createdAt: number;
   updatedAt: number;
   terminalAt: number | null;
@@ -181,6 +216,13 @@ const ROW_TO_JOB = (r: any): Job => ({
   runnerLog: r.runner_log ?? null,
   cancelRequested: !!r.cancel_requested,
   cancelRequestedAt: r.cancel_requested_at ?? null,
+  remoteProvider: r.remote_provider ?? null,
+  remoteWorkspaceId: r.remote_workspace_id ?? null,
+  remoteSessionId: r.remote_session_id ?? null,
+  remoteUrl: r.remote_url ?? null,
+  remoteCursor: r.remote_cursor ?? null,
+  remoteSawWorking: !!r.remote_saw_working,
+  remotePolledAt: r.remote_polled_at ?? null,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   terminalAt: r.terminal_at,
@@ -313,15 +355,20 @@ export class JobStore {
    * actually starts right away. A best-effort snapshot; the claim happens a moment later.
    */
   willQueue(entityId: string, concurrency: number): boolean {
-    const activePlaceholders = ACTIVE_STATES.map(() => "?").join(",");
+    const entityPlaceholders = ENTITY_LOCK_STATES.map(() => "?").join(",");
     const activeForEntity = this.db
-      .prepare(`SELECT 1 FROM jobs WHERE entity_id = ? AND state IN (${activePlaceholders}) LIMIT 1`)
-      .get(entityId, ...ACTIVE_STATES);
+      .prepare(`SELECT 1 FROM jobs WHERE entity_id = ? AND state IN (${entityPlaceholders}) LIMIT 1`)
+      .get(entityId, ...ENTITY_LOCK_STATES);
     if (activeForEntity) return true;
     const terminalPlaceholders = TERMINAL_STATES.map(() => "?").join(",");
+    // Jobs parked on a remote session are NOT ahead of this one — they hold no local slot. Counting
+    // them would tell every local delegation it was "queued" while a Conductor run happened to be
+    // waiting, which is exactly the kind of inaccurate status the queued-ack exists to avoid.
     const nonTerminal = (
       this.db
-        .prepare(`SELECT COUNT(*) c FROM jobs WHERE state NOT IN (${terminalPlaceholders})`)
+        .prepare(
+          `SELECT COUNT(*) c FROM jobs WHERE state NOT IN (${terminalPlaceholders}) AND state != 'remote-waiting'`,
+        )
         .get(...TERMINAL_STATES) as { c: number }
     ).c;
     // Subtract the just-enqueued job itself; if `concurrency` others are ahead, this one waits.
@@ -339,7 +386,8 @@ export class JobStore {
    */
   claimNext(owner: string, leaseMs = 120_000): Job | undefined {
     const t = this.now();
-    const active = `('${ACTIVE_STATES.join("','")}')`;
+    // ENTITY_LOCK_STATES, not SLOT_STATES: a job parked on a remote session still owns its ticket.
+    const active = `('${ENTITY_LOCK_STATES.join("','")}')`;
     const tx = this.db.transaction(() => {
       const row = this.db
         .prepare(
@@ -436,9 +484,12 @@ export class JobStore {
     }
     this.db
       .prepare(
+        // Same reasoning as scheduleRetry: a manual retry starts a fresh remote session. The
+        // workspace id is kept so the runner can reuse the warm clone instead of re-cloning.
         `UPDATE jobs SET state='queued', attempts=0, next_eligible_at=NULL, lease_owner=NULL,
            lease_expires_at=NULL, failure_class=NULL, failure_detail=NULL, terminal_at=NULL,
-           cancel_requested=0, cancel_requested_at=NULL, updated_at=@t
+           cancel_requested=0, cancel_requested_at=NULL,
+           remote_session_id=NULL, remote_cursor=NULL, remote_saw_working=NULL, updated_at=@t
          WHERE id=@id`,
       )
       .run({ id: jobId, t: this.now() });
@@ -491,8 +542,12 @@ export class JobStore {
     const attempts = (job?.attempts ?? 0) + 1;
     this.db
       .prepare(
+        // Clear the remote session: a retry must start a FRESH remote run. Resuming a session that
+        // already failed would just re-observe the failure, and the warm workspace is reused
+        // deliberately by the runner (via a new session) rather than by resuming the dead one.
         `UPDATE jobs SET state='queued', attempts=@a, next_eligible_at=@elig,
-           failure_class=@fc, failure_detail=@fd, lease_owner=NULL, lease_expires_at=NULL, updated_at=@t
+           failure_class=@fc, failure_detail=@fd, lease_owner=NULL, lease_expires_at=NULL,
+           remote_session_id=NULL, remote_cursor=NULL, remote_saw_working=NULL, updated_at=@t
          WHERE id=@id`,
       )
       .run({ a: attempts, elig: t + delayMs, fc: failureClass, fd: detail, t, id });
@@ -757,9 +812,108 @@ export class JobStore {
    * ~6 missed beats of slack before reclaim, so a transient stall (a GC pause, brief sync work) can't
    * SIGTERM a healthy runner; only a real death does. Returns the number reclaimed.
    */
+  /**
+   * Park a job on a remote session: it has been dispatched to Conductor Cloud and is now waiting on
+   * another machine. Returning from `processJob` in this state frees the local concurrency slot
+   * (the queue's cap is in-process `inFlight` accounting), while the per-entity lock is retained.
+   */
+  parkOnRemote(jobId: string): void {
+    const t = this.now();
+    this.db
+      .prepare(
+        `UPDATE jobs SET state='remote-waiting', lease_owner=NULL, lease_expires_at=NULL,
+           remote_polled_at=@t, updated_at=@t WHERE id=@id`,
+      )
+      .run({ t, id: jobId });
+    this.recordEvent(jobId, "state_change", { to: "remote-waiting", parked: true });
+  }
+
+  /**
+   * Claim a parked job for tracking. Unlike {@link claimNext} this does NOT change the state — the
+   * job stays `remote-waiting` while its remote session is polled, because that is what is actually
+   * true. Exclusivity comes from the lease; `remote_polled_at` is the liveness signal a stalled
+   * tracker is detected by.
+   */
+  claimRemoteWaiting(owner: string, leaseMs = 120_000): Job | undefined {
+    const t = this.now();
+    const tx = this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          // A cancel-requested job is deliberately still claimable: the tracker is the only thing
+          // that can reach the remote session to cancel it and finalize the job. Skipping it here
+          // would strand it in `remote-waiting` forever with a live cloud workspace behind it.
+          `SELECT * FROM jobs
+             WHERE state = 'remote-waiting'
+               AND (lease_expires_at IS NULL OR lease_expires_at < @t)
+             ORDER BY updated_at ASC LIMIT 1`,
+        )
+        .get({ t }) as any;
+      if (!row) return undefined;
+      this.db
+        .prepare(
+          `UPDATE jobs SET lease_owner=@owner, lease_expires_at=@exp, remote_polled_at=@t, updated_at=@t
+             WHERE id=@id`,
+        )
+        .run({ owner, exp: t + leaseMs, t, id: row.id });
+      return ROW_TO_JOB(row);
+    });
+    return tx();
+  }
+
+  /**
+   * A tracker tick failed, but the REMOTE session is still fine — e.g. Linear returned a proxy
+   * error page while we were fetching the issue to report against.
+   *
+   * Deliberately NOT `scheduleRetry`: that requeues into the main queue and clears the session, so
+   * the next attempt would dispatch a SECOND cloud workspace and orphan the one still doing the
+   * work. Instead the job stays parked with its session intact and simply becomes claimable again.
+   * Attempts are still counted, so a genuinely broken resume can't spin forever.
+   */
+  retryRemoteTracking(jobId: string, failureClass: string, detail: string): "parked" | "exhausted" {
+    const t = this.now();
+    const job = this.get(jobId);
+    const attempts = (job?.attempts ?? 0) + 1;
+    if (job && attempts >= job.maxAttempts) {
+      this.transition(jobId, "needs-attention", { failure_class: failureClass, failure_detail: detail });
+      return "exhausted";
+    }
+    this.db
+      .prepare(
+        `UPDATE jobs SET attempts=@a, lease_owner=NULL, lease_expires_at=NULL, remote_polled_at=@t,
+           failure_class=@fc, failure_detail=@fd, updated_at=@t
+         WHERE id=@id`,
+      )
+      .run({ a: attempts, t, fc: failureClass, fd: detail, id: jobId });
+    this.recordEvent(jobId, "retry", { attempts, failureClass, remote: true });
+    return "parked";
+  }
+
+  /** Heartbeat for a parked job — proves the tracker polling it is still alive. */
+  remotePoll(jobId: string, leaseMs = 120_000): void {
+    const t = this.now();
+    this.db
+      .prepare(`UPDATE jobs SET remote_polled_at=@t, lease_expires_at=@exp, updated_at=@t WHERE id=@id`)
+      .run({ t, exp: t + leaseMs, id: jobId });
+  }
+
+  /** Parked jobs whose tracker died: clear the lease so another tracker can pick them back up. */
+  reclaimStalledRemote(staleMs = 10 * 60_000): number {
+    const t = this.now();
+    const res = this.db
+      .prepare(
+        `UPDATE jobs SET lease_owner=NULL, lease_expires_at=NULL, updated_at=@t
+           WHERE state='remote-waiting' AND lease_owner IS NOT NULL
+             AND (remote_polled_at IS NULL OR remote_polled_at + @stale < @t)`,
+      )
+      .run({ t, stale: staleMs });
+    return res.changes;
+  }
+
   reclaimExpiredLeases(graceMs = 60_000): number {
     const t = this.now();
-    const active = `('${ACTIVE_STATES.join("','")}')`;
+    // Only SLOT_STATES carry a worker lease. Parked remote jobs are reclaimed by
+    // `reclaimStalledRemote` instead, since they legitimately sit for hours with no local worker.
+    const active = `('${SLOT_STATES.join("','")}')`;
     const stranded = this.db
       .prepare(
         `SELECT id FROM jobs WHERE state IN ${active} AND lease_expires_at IS NOT NULL AND lease_expires_at + @grace < @t`,

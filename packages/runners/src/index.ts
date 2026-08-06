@@ -24,3 +24,7 @@ export { parseRunnerResult } from "./result.js";
 export type { RunnerResult } from "./result.js";
 export { RunGuards, killTree, DEFAULT_GUARDS } from "./guards.js";
 export type { GuardTimeouts } from "./guards.js";
+export * from "./conductor-api.js";
+export * from "./conductor-git.js";
+export * from "./stream-json.js";
+export * from "./conductor.js";

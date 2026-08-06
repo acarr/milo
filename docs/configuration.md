@@ -23,6 +23,7 @@ All fields below show their **default**; every field except `repositories[].name
 | `trust` | object | see below | Webhook actor allowlists + signing secrets. |
 | `webhook` | object | see below | Daemon webhook server config. |
 | `progress` | object | see below | Live agent-session progress streaming (see below). |
+| `conductor` | object | see below | Conductor Cloud remote runner (see [conductor.md](./conductor.md)). |
 | `dependencies` | object | see below | Linear `blockedBy` sequencing (see below). |
 | `transports` | object | see below | Per-source polling + mode. |
 | `repositories` | array | `[]` | Per-repo setup (the core of routing). |
@@ -46,7 +47,8 @@ The list of repos Milo can work in. Each entry:
 | `routingLabels` | string[] | — | When **multiple** repos share a team key, the one whose `routingLabels` match the issue's labels wins. |
 | `routing` | `Record<string,string>` | — | Map of label → extra instruction injected into the prompt. |
 | `defaultRouting` | string | — | Routing instruction used when no `routing` label matches. |
-| `defaultRunner` | `"claude"`\|`"codex"` | — | Runner override for this repo (else the global default). |
+| `defaultRunner` | `"claude"`\|`"codex"`\|`"conductor"` | — | Runner override for this repo (else the global default). |
+| `conductor` | `{ projectId?, repositoryUrl?, agent?, model?, effort? }` | — | Per-repo Conductor Cloud settings. `projectId` is effectively **required** for a conductor repo (org API keys reject repos not on the org machine), and `githubRepo` becomes required too. |
 | `promptAugmentation` | string | — | System-prompt text appended after the global one, for this repo only. |
 | `teardownPolicy` | `"always"`\|`"keep-on-failure"` | `"always"` | Whether to keep the worktree when a job fails (for debugging). |
 | `githubRepo` | string (`owner/name`) | — | **Opt-in** for GitHub PR triggers (label / `@milo`). If omitted, the repo is **not** polled on GitHub. Inferred from the `origin` remote where possible. |
@@ -63,16 +65,18 @@ several, prefer the one whose `routingLabels` intersect the issue labels, else t
 ```json
 {
   "default": "claude",
-  "claude": { "modelChain": ["opus", "sonnet", "haiku"] },
-  "codex":  { "modelChain": ["gpt-5.5"] }
+  "claude":    { "modelChain": ["opus", "sonnet", "haiku"] },
+  "codex":     { "modelChain": ["gpt-5.5"] },
+  "conductor": { "modelChain": ["opus-5-1m"] }
 }
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `default` | `"claude"` | Runner used when nothing else selects one. |
+| `default` | `"claude"` | Runner used when nothing else selects one (`claude` \| `codex` \| `conductor`). |
 | `claude.modelChain` | `["opus","sonnet","haiku"]` | Ordered model preference for Claude. |
 | `codex.modelChain` | `["gpt-5.5"]` | Ordered model preference for Codex. |
+| `conductor.modelChain` | `["opus-5-1m"]` | Ordered model preference for Conductor Cloud. Model ids are **agent-specific** (`opus-*` for its claude agent, `gpt-*` for codex). |
 
 > Today only the **first** model in a chain is used (`router.modelFor` returns `chain[0]`). Walking the
 > chain on overload/crash is a planned follow-up (see `docs/REMAINING-WORK.md` B3).
@@ -160,6 +164,38 @@ issue** overrides the default for that issue. Cycles, blockers Milo isn't tracki
 blockers, and blocker PRs closed without merging all fall back to parallel (logged, plus one Linear
 comment if sequencing had been announced). See [job-lifecycle.md](./job-lifecycle.md#the-queue) and
 [database.md](./database.md#job_dependencies--blockedby-gates).
+
+---
+
+## `conductor`
+
+The remote runner. Full guide: **[conductor.md](./conductor.md)**.
+
+```json
+{
+  "baseUrl": "https://api.conductor.build/v0",
+  "userAgent": "milo (+https://github.com/acarr/milo)",
+  "agent": "claude",
+  "concurrency": 10,
+  "pollMs": 15000,
+  "dispatchTimeoutMs": 600000,
+  "cleanup": { "onSuccess": "archive", "onFailure": "sleep" },
+  "env": {}
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `apiKey` | — | Plaintext fallback. Prefer `CONDUCTOR_API_KEY` or `$MILO_HOME/secrets/conductor.json`. |
+| `concurrency` | `10` | Max remote sessions tracked at once — **separate from the top-level `concurrency`**, so parked remote jobs never consume a local slot. |
+| `baseUrl` | `https://api.conductor.build/v0` | API base. `GET /me` hangs off the origin, without `/v0`. |
+| `userAgent` | `milo (+…)` | **Required, not cosmetic** — Conductor's proxy 403s some default client signatures (e.g. Node's `undici`), which looks exactly like a bad key. |
+| `agent` | `"claude"` | Which agent runs *inside* the cloud workspace (`claude`/`codex`/`cursor`). Orthogonal to the Milo runner id. |
+| `effort` | — | Conductor reasoning effort (`none`…`ultra`). |
+| `pollMs` | `15000` | Session poll interval. Conductor has **no webhooks**. |
+| `dispatchTimeoutMs` | `600000` | Give up if the session never starts a turn. |
+| `cleanup.onSuccess` / `.onFailure` | `archive` / `sleep` | Workspace disposition. Forced to preserve when work is unreachable. |
+| `env` | `{}` | Env vars forwarded to the workspace. **Ships to a third party — keep secrets out.** |
 
 ---
 

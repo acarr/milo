@@ -13,7 +13,10 @@ Reference docs for Milo, the locally-running autonomous coding agent. Start with
 - **[Architecture](./architecture.md)** — the monorepo, package boundaries, dependency direction.
 - **[Triggers](./triggers.md)** — how work reaches Milo (Linear, GitHub, CLI, schedule) and dedup.
 - **[Job Lifecycle](./job-lifecycle.md)** — the state machine, queue, retries, leases.
-- **[Runners](./runners.md)** — Claude & Codex, model selection, the `MILO_RESULT` protocol, the prompt.
+- **[Runners](./runners.md)** — Claude, Codex & Conductor, model selection, the `MILO_RESULT` protocol,
+  the prompt.
+- **[Conductor Cloud](./conductor.md)** — the remote runner: setup, the branch contract, session
+  tracking, resume semantics.
 - **[Reliability](./reliability.md)** — the two sacred invariants, verification gate, circuit breaker,
   watchdog, idempotency.
 - **[Scheduling & Maintenance](./scheduling.md)** — the in-daemon cron scheduler and housekeeping.

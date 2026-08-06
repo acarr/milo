@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
 import { JobStore } from "../src/jobs.js";
+import { openDatabase } from "../src/store.js";
 import { MiloConfigSchema } from "../src/config.js";
 import {
   resolveDependencyStrategy,
@@ -11,24 +11,13 @@ import {
   dependencyHold,
 } from "../src/dependencies.js";
 
+/**
+ * Use the REAL schema (`openDatabase`), not a hand-rolled copy: a duplicated CREATE TABLE silently
+ * rots every time a column is added to `store.ts`, and the failure surfaces as an opaque
+ * SQLITE_ERROR in an unrelated assertion. `:memory:` keeps it fast and isolated.
+ */
 function freshStore(): JobStore {
-  const db = new Database(":memory:");
-  db.exec(`
-    CREATE TABLE jobs (id TEXT PRIMARY KEY, identity_key TEXT UNIQUE, source TEXT, entity_id TEXT,
-      entity_ref TEXT, trigger_type TEXT, content_hash TEXT, state TEXT, mode TEXT DEFAULT 'create',
-      runner TEXT, model TEXT, custom_prompt TEXT, repo TEXT, worktree_path TEXT, branch TEXT, base_branch TEXT,
-      routing_instruction TEXT, attempts INTEGER DEFAULT 0, max_attempts INTEGER DEFAULT 3,
-      next_eligible_at INTEGER, lease_owner TEXT, lease_expires_at INTEGER, last_heartbeat_at INTEGER,
-      declared_outcome TEXT, declared_pr_url TEXT, declared_wrote_code INTEGER, verified_outcome TEXT,
-      pr_url TEXT, failure_class TEXT, failure_detail TEXT, summary TEXT,
-      created_at INTEGER, updated_at INTEGER, terminal_at INTEGER);
-    CREATE TABLE job_events (id TEXT PRIMARY KEY, job_id TEXT, seq INTEGER, kind TEXT, from_state TEXT,
-      to_state TEXT, data TEXT, at INTEGER);
-    CREATE TABLE side_effects (idempotency_key TEXT PRIMARY KEY, kind TEXT, external_id TEXT, created_at INTEGER);
-    CREATE TABLE job_dependencies (dependent_entity_id TEXT, blocker_entity_id TEXT, strategy TEXT DEFAULT 'wait',
-      resolved INTEGER DEFAULT 0, blocker_branch TEXT, created_at INTEGER, updated_at INTEGER,
-      PRIMARY KEY (dependent_entity_id, blocker_entity_id));
-  `);
+  const db = openDatabase(":memory:");
   let clock = 1;
   return new JobStore(db, () => clock++);
 }
