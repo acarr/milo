@@ -9,7 +9,7 @@ on the box. Everything below assumes macOS.
 
 | Tool | Required? | Why | Check |
 |------|:---------:|-----|-------|
-| **Node** ≥ 22 | ✅ | Runtime (dev runs from source via `tsx`) | `node -v` |
+| **Node** — an LTS line (22 or 24) | ✅ | Runtime (dev runs from source via `tsx`). Stick to LTS; an `.nvmrc` pins 24 (`nvm use`) | `node -v` |
 | **pnpm** 9.x | ✅ | Workspace package manager | `pnpm -v` |
 | **Claude Code** (`claude`) | ✅ | Default runner — uses your Claude **subscription** | `claude --version` |
 | **Codex** (`codex`) | optional | Alternate runner — uses your ChatGPT **subscription** | `codex --version` |
@@ -20,6 +20,13 @@ on the box. Everything below assumes macOS.
 
 > Milo never uses API billing. The runners are invoked through your interactive subscriptions; the
 > launchd bootstrap (below) actively strips `ANTHROPIC_API_KEY` / OpenAI keys from the environment.
+
+> **Why an LTS Node?** Milo's SQLite store (`better-sqlite3`) is a native module. On an LTS line it
+> installs a **prebuilt binary** — no compiler needed. On a brand-new "Current" Node release (23, 25, …)
+> no prebuilt binary exists yet, so `pnpm install` falls back to compiling from source via `node-gyp`,
+> which needs a C/C++ toolchain. If you ever land on that path and the install fails on `better-sqlite3`,
+> install the toolchain (`xcode-select --install` on macOS) — but the simpler fix is to `nvm use` an
+> LTS line so the prebuilt binary is fetched instead.
 
 Run `milo doctor` at any point to verify all of the above (see [operations.md](./operations.md#milo-doctor)).
 
