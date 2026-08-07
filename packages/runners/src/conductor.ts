@@ -103,6 +103,8 @@ export interface ConductorRunResult {
   unreachableWork?: boolean;
   /** Set by `phase: "dispatch"` — the session is live and the caller should park the job. */
   dispatched?: boolean;
+  /** Why the run did not finish cleanly, when it didn't. See {@link ClaudeRunResult.errorDetail}. */
+  errorDetail?: string;
 }
 
 /**
@@ -161,7 +163,15 @@ class ConductorRun {
 
   // ---------------------------------------------------------------- plumbing
 
+  /**
+   * True while re-reading already-consumed transcript on resume. The messages are replayed purely to
+   * rebuild `output`; re-emitting them would repost the whole run's narration to the Linear session
+   * and re-append it to the log, so every outward-facing sink is muted for the duration.
+   */
+  private replaying = false;
+
   private emit(e: RunnerEvent): void {
+    if (this.replaying) return;
     try {
       this.o.onEvent?.(e);
     } catch {
@@ -169,7 +179,13 @@ class ConductorRun {
     }
   }
 
+  private echoWrite(s: string): void {
+    if (this.replaying) return;
+    this.o.echo?.write(s);
+  }
+
   private writeLog(obj: unknown): void {
+    if (this.replaying) return;
     try {
       this.log.write(JSON.stringify(obj) + "\n");
     } catch {
@@ -179,15 +195,16 @@ class ConductorRun {
 
   private appendText(text: string): void {
     this.output += (this.output.endsWith("\n") || this.output === "" ? "" : "\n") + text + "\n";
-    this.o.echo?.write(text.endsWith("\n") ? text : text + "\n");
+    this.echoWrite(text.endsWith("\n") ? text : text + "\n");
   }
 
   private note(text: string): void {
     this.emit({ kind: "notice", text });
-    this.o.echo?.write(`• ${text}\n`);
+    this.echoWrite(`• ${text}\n`);
   }
 
   private persist(): void {
+    if (this.replaying) return; // a replay must not rewind the durable cursor
     if (this.session) {
       try {
         this.o.onSession?.({ ...this.session });
@@ -220,7 +237,7 @@ class ConductorRun {
       this.writeLog({ t: "error", message });
       this.appendText(`[milo] Conductor run failed: ${message}`);
       this.note(`Conductor run failed: ${message}`);
-      return this.done(1);
+      return this.done(1, { errorDetail: message.slice(0, 300) });
     }
   }
 
@@ -285,7 +302,13 @@ class ConductorRun {
     }
 
     await this.cleanup(settled === "ok");
-    return this.done(settled === "ok" ? 0 : 1);
+    if (settled === "ok") return this.done(0);
+    return this.done(1, {
+      errorDetail:
+        settled === "error"
+          ? "the Conductor session reported an error"
+          : "the Conductor session was cancelled after a timeout",
+    });
   }
 
   /** Resume an existing session when possible, else create a fresh workspace. */
@@ -298,8 +321,20 @@ class ConductorRun {
         this.session = { ...resume };
         this.note(`Reconnected to the Conductor workspace already running this job.`);
         this.writeLog({ t: "resume", workspaceId: resume.workspaceId, sessionId: resume.sessionId });
-        // Rebuild `output` from the transcript we already consumed so MILO_RESULT is still findable.
-        await this.drainMessages();
+        // Replay the WHOLE transcript, not just what's past the saved cursor. `output` starts empty
+        // on every invocation, so draining from the cursor rebuilds nothing — and a resume that
+        // finds no new messages (its predecessor already consumed them) would then finalize on an
+        // empty output, losing the agent's MILO_RESULT entirely. SBX-16 shipped PR #19 described as
+        // "Implements SBX-16" that way on 2026-08-05, with a good 311-char summary sitting unread in
+        // the transcript. The cursor is restored afterwards so `persist` stays correct.
+        this.replaying = true;
+        this.session.cursor = undefined;
+        try {
+          await this.drainMessages();
+        } finally {
+          this.replaying = false;
+          this.session.cursor ??= resume.cursor; // an empty transcript leaves the saved cursor intact
+        }
         return;
       }
       this.note("The previous Conductor workspace is gone — starting a fresh one.");
@@ -467,7 +502,7 @@ class ConductorRun {
         this.emit({ kind: "narration", text: item.text });
       } else if (item.kind === "event") {
         this.emit(item.event);
-        this.o.echo?.write(`• ${item.event.text}\n`);
+        this.echoWrite(`• ${item.event.text}\n`);
       } else {
         this.output += (this.output.endsWith("\n") ? "" : "\n") + item.text + "\n";
         if (item.isError) this.emit({ kind: "notice", text: `Run reported an error: ${item.text}` });

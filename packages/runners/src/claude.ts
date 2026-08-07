@@ -27,6 +27,13 @@ export interface ClaudeRunResult {
   code: number;
   output: string;
   logFile: string;
+  /**
+   * Why the run did not finish cleanly, when it didn't. A `claude -p` run that dies mid-response
+   * still emits a terminal `result` event (with `is_error`) and can still exit 0, so the exit code
+   * alone cannot tell a finished run from an abandoned one — and the verification gate must not
+   * ship a half-written worktree as a completed implementation (WAZ-1150 / PR #707, 2026-08-07).
+   */
+  errorDetail?: string;
 }
 
 /** Keys that must be unset so Claude Code uses the Max subscription (OAuth), not API billing. */
@@ -84,6 +91,7 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
       detached: true,
     });
     let output = "";
+    let errorDetail: string | undefined;
 
     const emit = (e: RunnerEvent) => {
       try {
@@ -139,7 +147,10 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
         } else {
           // The final result text carries MILO_RESULT — keep it in `output` for the parser.
           output += (output.endsWith("\n") ? "" : "\n") + item.text + "\n";
-          if (item.isError) emit({ kind: "notice", text: `Run reported an error: ${item.text}` });
+          if (item.isError) {
+            errorDetail = item.text.trim().slice(0, 300);
+            emit({ kind: "notice", text: `Run reported an error: ${item.text}` });
+          }
           // The work is done; if the CLI lingers (MCP children holding it open), the guard kills it.
           guards.sawResult();
         }
@@ -180,7 +191,17 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
       log.end();
       // A guard kill after the final result is still a successful run — the output is complete and
       // the pipeline's verification gate re-derives the real outcome from git/GitHub state anyway.
-      resolve({ code: guards.completedBeforeKill ? 0 : (code ?? 1), output, logFile: opts.logFile });
+      // A guard kill BEFORE any result means the run was abandoned mid-flight; say so, since the
+      // exit code of a killed process doesn't distinguish that from an ordinary failure.
+      if (!errorDetail && guards.killReason && !guards.completedBeforeKill) {
+        errorDetail = `runner was killed: ${guards.killReason}`;
+      }
+      resolve({
+        code: guards.completedBeforeKill ? 0 : (code ?? 1),
+        output,
+        logFile: opts.logFile,
+        ...(errorDetail ? { errorDetail } : {}),
+      });
     });
   });
 }

@@ -190,6 +190,59 @@ test("a resumed workspace that was archived falls back to creating a fresh one",
   assert.equal(api.sentMessages.length, 1);
 });
 
+test("a resume past the saved cursor still rebuilds output from the WHOLE transcript", async () => {
+  // The live failure (SBX-16, 2026-08-05): a first resume consumed the transcript and persisted its
+  // cursor, then a second resume drained from that cursor, found nothing, and finalized on an EMPTY
+  // output. The agent's MILO_RESULT — a good 311-character summary — was never read, so the gate
+  // opened PR #19 described as nothing but "Implements SBX-16". `output` starts empty on every
+  // invocation, so a resume must replay everything, not just what arrived since.
+  const messages = fixtureMessages();
+  const lastId = messages[messages.length - 1]!.id;
+  const api = new FakeApi(["idle"], messages);
+
+  const res = await runConductor(
+    baseOpts(api, {
+      resume: {
+        workspaceId: "ws-existing",
+        sessionId: "sess-existing",
+        deepLink: "d",
+        sawWorking: true,
+        cursor: lastId, // everything already consumed by a previous tracker
+      },
+    }) as never,
+  );
+
+  assert.match(res.output, /MILO_PROBE=/, "the agent's final line must be recovered, not lost");
+  assert.equal(api.createdWorkspaces, 0, "still a reattach, not a re-create");
+});
+
+test("replaying a resumed transcript does not re-emit its narration or rewind the cursor", async () => {
+  // The replay exists only to rebuild `output`. Re-emitting would repost the whole run's narration
+  // to the Linear agent session, and re-persisting a rewound cursor would make the next resume
+  // replay from scratch again.
+  const messages = fixtureMessages();
+  const lastId = messages[messages.length - 1]!.id;
+  const api = new FakeApi(["idle"], messages);
+  const events: RunnerEvent[] = [];
+  const cursors: Array<string | undefined> = [];
+
+  const res = await runConductor(
+    baseOpts(api, {
+      resume: { workspaceId: "ws", sessionId: "s", deepLink: "d", sawWorking: true, cursor: lastId },
+      onEvent: (e: RunnerEvent) => events.push(e),
+      onSession: (s: { cursor?: string }) => cursors.push(s.cursor),
+    }) as never,
+  );
+
+  assert.match(res.output, /MILO_PROBE=/, "the replay must still happen — otherwise this proves nothing");
+  assert.equal(
+    events.filter((e) => e.kind === "narration").length,
+    0,
+    "a silent replay must not repost the transcript",
+  );
+  assert.ok(!cursors.includes(undefined), "the durable cursor must never be rewound to the start");
+});
+
 test("session state is persisted BEFORE the prompt is sent, so a crash resumes", async () => {
   const api = new FakeApi(["working", "idle"]);
   const seen: Array<{ workspaceId: string; sessionId: string }> = [];

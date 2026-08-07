@@ -28,6 +28,8 @@ export interface CodexRunResult {
   code: number;
   output: string;
   logFile: string;
+  /** Why the run did not finish cleanly, when it didn't. See {@link ClaudeRunResult.errorDetail}. */
+  errorDetail?: string;
 }
 
 /**
@@ -244,7 +246,15 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexRunResult> {
         log.write(block);
       }
       log.end();
-      resolve({ code: code ?? 1, output, logFile: opts.logFile });
+      // Codex has no terminal stream event, so a guard kill is the only "abandoned mid-flight"
+      // signal there is — and the gate must not ship a killed run's worktree as a finished one.
+      const errorDetail = guards.killReason ? `runner was killed: ${guards.killReason}` : undefined;
+      resolve({
+        code: code ?? 1,
+        output,
+        logFile: opts.logFile,
+        ...(errorDetail ? { errorDetail } : {}),
+      });
     });
   });
 }

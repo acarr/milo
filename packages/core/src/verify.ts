@@ -94,11 +94,83 @@ export interface EnsurePrInput {
   summary: string;
   /** Issue/ticket id to auto-close on merge (`Closes <id>`). Omit for jobs with no ticket (scheduled prompts). */
   closes?: string;
+  /**
+   * Set when the run did not finish cleanly. The PR is opened as a draft and says so up front —
+   * the "code never lives without a PR" guarantee still holds, but nobody should read a crashed
+   * run's half-written worktree as a finished implementation.
+   */
+  incomplete?: { reason: string };
 }
 
 export interface EnsurePrResult {
   prUrl: string;
   remediated: boolean; // true if Milo had to create/push it itself
+}
+
+/** Commit subjects on `branch` that aren't on the base, oldest first. */
+function commitSubjects(worktreePath: string, baseBranch: string): string[] {
+  for (const base of [`origin/${baseBranch}`, baseBranch]) {
+    const r = git(worktreePath, ["log", "--reverse", "--format=%s", `${base}..HEAD`]);
+    if (r.code === 0) return r.out.split("\n").map((l) => l.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+/** `28 files changed, 11895 insertions(+), 393 deletions(-)` — or undefined if git can't say. */
+function diffStat(worktreePath: string, baseBranch: string): string | undefined {
+  for (const base of [`origin/${baseBranch}`, baseBranch]) {
+    const r = git(worktreePath, ["diff", "--shortstat", `${base}...HEAD`]);
+    if (r.code === 0 && r.out) return r.out;
+  }
+  return undefined;
+}
+
+const MAX_LISTED_COMMITS = 20;
+
+/**
+ * Build the PR description Milo writes when it opens the PR itself.
+ *
+ * The agent's `summary` is one or two sentences at best, and is missing entirely whenever its run
+ * died or its `MILO_RESULT` line didn't parse — which is how PRs like #707 ended up described as
+ * nothing but `Implements WAZ-1150`. So the body is grounded in what git can prove happened
+ * (commits, diffstat) and treats the agent's summary as a bonus rather than the whole story.
+ */
+export function buildPrBody(input: {
+  worktreePath: string;
+  baseBranch: string;
+  ref: string;
+  summary: string;
+  closes?: string;
+  incomplete?: { reason: string };
+}): string {
+  const { worktreePath, baseBranch, ref, summary, closes, incomplete } = input;
+  const parts: string[] = [];
+
+  if (incomplete) {
+    parts.push(
+      `> [!WARNING]\n` +
+        `> **This run did not finish.** ${incomplete.reason}\n` +
+        `>\n` +
+        `> Milo opened this PR as a **draft** so the work isn't lost, but nothing here has been\n` +
+        `> confirmed complete or verified. Review the diff before trusting it.`,
+    );
+  }
+
+  parts.push(`## Summary\n\n${summary.trim() || `Milo's agent left no summary for ${ref}. What it changed, from git:`}`);
+
+  const commits = commitSubjects(worktreePath, baseBranch);
+  if (commits.length) {
+    const listed = commits.slice(0, MAX_LISTED_COMMITS).map((c) => `- ${c}`);
+    if (commits.length > MAX_LISTED_COMMITS) listed.push(`- …and ${commits.length - MAX_LISTED_COMMITS} more`);
+    parts.push(`## Commits\n\n${listed.join("\n")}`);
+  }
+
+  const stat = diffStat(worktreePath, baseBranch);
+  if (stat) parts.push(`## Files changed\n\n${stat}`);
+
+  if (closes) parts.push(`Closes ${closes}`);
+  parts.push(`_PR opened by Milo's verification gate._`);
+  return parts.join("\n\n");
 }
 
 /**
@@ -107,22 +179,23 @@ export interface EnsurePrResult {
  * never left without a PR (the classic failure mode of naive coding agents), with no dependence on the model.
  */
 export function ensurePr(input: EnsurePrInput): EnsurePrResult {
-  const { worktreePath, baseBranch, branch, ref, title, summary, closes } = input;
+  const { worktreePath, baseBranch, branch, ref, title, summary, closes, incomplete } = input;
   const gt = resolveGroundTruth(worktreePath, baseBranch, branch);
   if (gt.prUrl) return { prUrl: gt.prUrl, remediated: false };
 
-  logger.warn({ ref, branch }, "code present but no PR — Milo is opening it directly");
+  logger.warn({ ref, branch, incomplete: incomplete?.reason }, "code present but no PR — Milo is opening it directly");
 
   if (gt.dirty) {
     git(worktreePath, ["add", "-A"]);
-    const c = git(worktreePath, ["commit", "-m", `${ref}: ${title}`]);
+    const message = incomplete ? `${ref}: ${title} (partial — run did not finish)` : `${ref}: ${title}`;
+    const c = git(worktreePath, ["commit", "-m", message]);
     if (c.code !== 0) logger.warn({ out: c.out }, "commit during remediation reported an issue");
   }
   const push = git(worktreePath, ["push", "-u", "origin", "HEAD"]);
   if (push.code !== 0) logger.warn({ out: push.out }, "push during remediation reported an issue");
 
-  const closesLine = closes ? `\n\nCloses ${closes}` : "";
-  const body = `${summary}${closesLine}\n\n_PR opened by Milo's verification gate._`;
+  // Built AFTER the commit above, so the diffstat and commit list describe everything being shipped.
+  const body = buildPrBody({ worktreePath, baseBranch, ref, summary, closes, incomplete });
   const create = gh(worktreePath, [
     "pr",
     "create",
@@ -131,9 +204,10 @@ export function ensurePr(input: EnsurePrInput): EnsurePrResult {
     "--head",
     branch,
     "--title",
-    title,
+    incomplete ? `[incomplete] ${title}` : title,
     "--body",
     body,
+    ...(incomplete ? ["--draft"] : []),
   ]);
   const urlMatch = create.out.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
   if (!urlMatch) {
