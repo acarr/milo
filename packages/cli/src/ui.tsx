@@ -1,7 +1,7 @@
 import React from "react";
 import { render, Box, Text, useApp, useInput } from "ink";
 import { useState, useEffect, useRef } from "react";
-import { Scheduler, type PersistedEvent } from "@milo/core";
+import { Scheduler, RUNNERS, type PersistedEvent } from "@milo/core";
 import { createClient, type MiloClient, type StateFilter, type SchedulesView as SchedulesData, type ScheduleViewRow, type SettingsPatch } from "./viewmodel.js";
 import { runDoctor, type CheckResult } from "./doctor.js";
 import { Header, Footer, Tabs } from "./components/index.js";
@@ -233,8 +233,12 @@ export function App({
     if (!settingsData) return;
     const label = SETTINGS_ROWS[settingsIdx];
     let patch: SettingsPatch;
-    if (label === "default runner") patch = { defaultRunner: settingsData.defaultRunner === "claude" ? "codex" : "claude" };
-    else if (label === "webhook") patch = { webhookEnabled: !settingsData.webhookEnabled };
+    if (label === "default runner") {
+      // Cycle the runner list (wrapping both ways) rather than toggling a pair — there are three now.
+      const i = RUNNERS.indexOf(settingsData.defaultRunner as (typeof RUNNERS)[number]);
+      const next = RUNNERS[(((i < 0 ? 0 : i) + dir) % RUNNERS.length + RUNNERS.length) % RUNNERS.length]!;
+      patch = { defaultRunner: next };
+    } else if (label === "webhook") patch = { webhookEnabled: !settingsData.webhookEnabled };
     else if (label === "auto-merge PRs") patch = { autoMerge: !settingsData.autoMerge };
     else patch = { concurrency: Math.max(1, settingsData.concurrency + dir) };
     const res = client.updateSettings(patch);

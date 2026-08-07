@@ -16,8 +16,9 @@ database, operations).
 - **Four trigger surfaces** — a `milo` label or agent-session delegation in Linear, a `milo` label /
   `@milo` comment on a GitHub PR (attach mode), the `milo <ID>` CLI, and cron schedules (including
   in-repo `.milo/schedules.json` prompt schedules).
-- **Two runners** — ClaudeRunner and CodexRunner behind a runner registry; selection is `[agent=codex]`
-  in the issue > a `runner:<id>` label > the repo default > the global default.
+- **Three runners** — ClaudeRunner and CodexRunner run locally; **ConductorRunner** hands the work to a
+  Conductor Cloud workspace. Selection is unchanged: `[agent=<id>]` in the issue > a `runner:<id>` label
+  > the repo default > the global default.
 - **Reliability core** — durable SQLite queue, bounded concurrency + per-entity serialization,
   retry/backoff, crash recovery, a per-repo circuit breaker, and a lease watchdog that requeues jobs
   whose worker died.
@@ -52,7 +53,9 @@ packages/core        Job model + store (jobs.ts), queue (queue.ts), verification
                      (router.ts: runner/repo resolution), scheduler (scheduler.ts), maintenance
                      (maintenance.ts), worktree mgr (worktree.ts: create + attach), prompt (prompt.ts),
                      config (config.ts), paths, daemon-state, logger, SQLite (store.ts)
-packages/runners     ClaudeRunner (claude.ts), CodexRunner (codex.ts), result parser (result.ts)
+packages/runners     ClaudeRunner (claude.ts), CodexRunner (codex.ts), ConductorRunner (conductor.ts +
+                     conductor-api.ts + conductor-git.ts), shared Claude stream-json mapping
+                     (stream-json.ts), result parser (result.ts)
 packages/daemon      long-lived worker (index.ts → startDaemon): drains the queue + startPolling
                      (poller.ts) + startScheduling (scheduling.ts)
 packages/cli         command dispatch (index.ts), run/jobs/status/logs/poll/schedules (run.ts),
@@ -62,7 +65,7 @@ packages/transports  JobIntent + intentToNewJob (index.ts); pollers: linear.ts (
 ```
 
 Key design points:
-- **Job lifecycle** (jobs.ts): `queued → claimed → setting-up → running → verifying → (remediating) →
+- **Job lifecycle** (jobs.ts): `queued → claimed → setting-up → running → (remote-waiting) → verifying → (remediating) →
   reporting → done | discovery-done | retrying | failed | needs-attention | abandoned`. SQLite is the
   source of truth (durable across restarts; `recoverOnStartup` requeues stranded jobs).
 - **Queue** (queue.ts): `claimNext` enforces both the concurrency cap and per-entity exclusion; `drain()`
@@ -161,6 +164,30 @@ pnpm test             # node --test via tsx; queue + TUI + core/runner tests
   any success calls `recordRepoSuccess` to reset. `repoHealth()` lazily flips `open→half-open` once
   the cooldown elapses, so the next job is the probe.
 - Disk can be tight on small machines — worktrees always tear down.
+- **A parked remote job holds the entity lock but NOT a local slot.** `SLOT_STATES` vs
+  `ENTITY_LOCK_STATES` in `jobs.ts` is the split; `remote-waiting` is in the latter only. A conductor
+  run dispatches, parks, and RETURNS from `processJob` (the queue cap is in-process `inFlight`, so
+  returning is what frees the slot); the daemon's remote tracker resumes it under its own
+  `conductor.concurrency`. Consequences that bite if forgotten: `willQueue` must exclude parked jobs,
+  the lease watchdog must ignore them (liveness is `remote_polled_at` + `reclaimStalledRemote`),
+  `recoverOnStartup` must leave them parked, a cancel-requested parked job must stay claimable, and a
+  failed tracker tick must use `retryRemoteTracking` (keeps the session) rather than `scheduleRetry`
+  (clears it → duplicate workspace).
+- **Conductor is remote — the contract is a BRANCH, not a PR.** A Conductor session runs in a cloud
+  workspace Milo cannot read (no diff/git/file endpoints in the API). So the prompt dictates the branch
+  and **forbids `gh pr create`**; after the session ends the runner fetches + hard-resets the local
+  worktree onto `origin/<branch>`, and the ordinary gate opens the PR. `verify.ts` is untouched. Don't
+  "fix" this by asking the agent for the PR URL — that reintroduces duplicate-PR and auth hazards.
+  Conductor prefixes its own workspace branch (`conductor/<name>`), so the branch must be dictated,
+  never inferred. Remote jobs create the worktree with `skipSetup` (it's only the git/gh cwd).
+- **Conductor `idle` lies until you've seen `working`.** A queued prompt reports `idle` until its turn
+  starts, so the "have I seen working?" latch is correctness state and is persisted on the job
+  (`remote_saw_working`) — otherwise a daemon restart mid-run reads the between-turns `idle` as done.
+  `recoverOnStartup` re-dispatches remote jobs too, which must mean **reattach**, not "second workspace":
+  hence the `remote_*` columns, persisted *before* the prompt is sent.
+- **Org Conductor API keys need `projectId`.** `repositoryUrl` is rejected unless the repo has been
+  added to the org's Cloud computer in Conductor's settings. Also: send a real `User-Agent` — their
+  proxy 403s default client signatures, which looks exactly like a bad API key.
 - **Codex git sandbox**: under `-s workspace-write`, Codex commits via an alternate
   `GIT_OBJECT_DIRECTORY` (it can't touch the real `.git`), so the working tree is left dirty with no
   branch commit. That's fine — **the verification gate** sees the dirty tree and commits/pushes/opens the

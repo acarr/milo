@@ -188,7 +188,7 @@ function matchesState(j: Job, want?: StateFilter): boolean {
 function matchesSearch(j: Job, q?: string): boolean {
   if (!q) return true;
   const needle = q.toLowerCase();
-  return [j.entityRef, j.entityId, j.summary, j.prUrl, j.branch, j.repo]
+  return [j.entityRef, j.entityId, j.summary, j.prUrl, j.branch, j.repo, j.remoteUrl]
     .some((v) => typeof v === "string" && v.toLowerCase().includes(needle));
 }
 
@@ -201,7 +201,7 @@ function toRow(j: Job, now: number): JobRow {
     runner: j.runner,
     repo: j.repo,
     prUrl: j.prUrl,
-    detail: j.prUrl ?? j.failureDetail ?? j.summary ?? null,
+    detail: j.prUrl ?? j.failureDetail ?? j.summary ?? j.remoteUrl ?? null,
     ageMs: now - j.createdAt,
     attempts: j.attempts,
     maxAttempts: j.maxAttempts,

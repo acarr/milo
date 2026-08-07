@@ -99,6 +99,138 @@ Where outcome is one of "implemented" | "discovery" | "blocked", wroteCode is a 
 PR URL (or null), and summary is one or two sentences.`;
 }
 
+export interface ConductorPromptInput {
+  repo: RepoConfig;
+  issue: LinearIssue;
+  routingInstruction: string;
+  /** The branch the agent MUST push — Milo's only way to find the work afterwards. */
+  branch: string;
+  baseBranch: string;
+  /** `owner/name`, so the agent knows which repo it is looking at. */
+  githubRepo: string;
+}
+
+/**
+ * The implementation prompt for a **Conductor Cloud** run.
+ *
+ * Differs from {@link buildPrompt} because the agent is on a machine Milo cannot see:
+ *  - there is no known working directory (the cloud workspace path is Milo's business, not ours);
+ *  - the ONLY observable output is what reaches `origin`, so pushing is the load-bearing step;
+ *  - the agent must NOT open the PR — Milo's verification gate does that from the local clone,
+ *    which keeps the "code always gets a PR" guarantee independent of the model's diligence.
+ *
+ * The branch name is the entire local/remote contract, so it is stated three times: as context, as
+ * a mandatory first action, and as a self-check.
+ */
+export function buildConductorPrompt({
+  repo,
+  issue,
+  routingInstruction,
+  branch,
+  baseBranch,
+  githubRepo,
+}: ConductorPromptInput): string {
+  const comments =
+    issue.comments.length > 0
+      ? issue.comments.map((c) => `[${c.author} — ${c.createdAt}]:\n${c.body}`).join("\n\n")
+      : "No comments";
+
+  return `<context>
+  <repository>${repo.name}</repository>
+  <github_repo>${githubRepo}</github_repo>
+  <base_branch>${baseBranch}</base_branch>
+  <branch>${branch}</branch>
+  <package_manager>${repo.packageManager}</package_manager>
+</context>
+
+<workspace>
+You are in a Conductor cloud workspace containing a clone of ${githubRepo}. Run \`pwd\` to find your
+working directory — it is NOT any path on Milo's machine.
+
+Milo is running on a DIFFERENT machine and cannot see this filesystem. The only thing it can observe
+is what you push to \`origin\`. Work that is committed but not pushed is invisible to Milo and will
+be lost when this workspace is torn down.
+</workspace>
+
+<linear_issue>
+  <identifier>${issue.identifier}</identifier>
+  <title>${issue.title}</title>
+  <priority>${issue.priorityLabel}</priority>
+  <url>${issue.url}</url>
+  <labels>${issue.labels.join(", ")}</labels>
+  <description>
+${issue.description || "No description"}
+  </description>
+  <comments>
+${comments}
+  </comments>
+</linear_issue>
+
+<routing>
+${routingInstruction}
+</routing>
+
+You are autonomously implementing a Linear ticket. The CLAUDE.md in this repository contains all
+project conventions, patterns, and architecture — follow them strictly.
+
+## Your Workflow — execute IN ORDER, do not skip, do not stop between phases unless blocked.
+
+### Phase 0: Switch to Milo's branch (MANDATORY FIRST ACTION)
+Run:
+\`\`\`
+git switch -c ${branch} 2>/dev/null || (git fetch origin ${branch} && git switch ${branch})
+\`\`\`
+This exact branch name is a contract with Milo — it is how Milo finds your work. Do not rename it,
+do not work on the workspace's default branch, and do not push anywhere else.
+
+### Phase 1: Understand and Plan
+1. Read the ticket description and comments above.
+2. Read CLAUDE.md for project conventions.
+3. Read the existing code relevant to the ticket scope.
+
+### Phase 2: Implement
+Make the code changes per the ticket, following CLAUDE.md conventions and the routing note above.
+
+### Phase 3: Verify (MANDATORY)
+Run the project's verification. If it has a \`verify\` script, run it; otherwise run typecheck/build/test
+and lint as available.
+
+### Phase 4: Fix and Re-verify
+If verification fails, fix with the smallest change and re-run. Up to 3 attempts; if still failing,
+proceed to Phase 5 but note the failures in your summary.
+
+### Phase 5: Commit and Push (THE MOST IMPORTANT STEP)
+1. Stage changed files explicitly (no \`git add -A\`/\`git add .\`).
+2. Commit with a conventional message ending with a line: \`Implements ${issue.identifier}\`.
+3. Push: \`git push -u origin ${branch}\`.
+4. Confirm it landed: \`git ls-remote --exit-code origin ${branch}\` — this MUST succeed before you finish.
+
+Push as soon as you have your first commit, and again after each subsequent commit. Do not save the
+push for the end — an unpushed commit is a lost commit.
+
+### Phase 6: Do NOT create a pull request
+Milo opens the pull request itself from its own machine once it sees your branch on \`origin\`.
+Do NOT run \`gh pr create\`, \`gh pr edit\`, or \`gh pr ready\` — doing so creates a duplicate PR.
+
+## Critical Rules
+1. Work only inside this repository checkout, on branch \`${branch}\`.
+2. Do NOT ask questions or wait for input — run fully autonomously.
+3. If the ticket is genuinely a discovery/answer task with NO code to write, do not invent code and do
+   not push an empty branch — set outcome=discovery below and put your findings in the summary.
+4. **If you write ANY code you MUST commit AND push it to \`${branch}\`.** Milo cannot see this
+   filesystem; unpushed work is lost work. \`git push\` is not optional.
+5. If you hit an unrecoverable blocker (e.g. infra down), set outcome=blocked and explain.
+
+## Final output (REQUIRED)
+As the very last line of your response, print one line of machine-readable JSON, prefixed exactly
+with \`MILO_RESULT=\` and nothing after it, e.g.:
+
+MILO_RESULT={"outcome":"implemented","wroteCode":true,"branch":"${branch}","prUrl":null,"summary":"Added X and Y; verify passed."}
+
+Where outcome is one of "implemented" | "discovery" | "blocked", wroteCode is a boolean, branch is the
+branch you pushed, and summary is one or two sentences. Always leave prUrl null — Milo opens the PR.`;
+}
+
 export interface FreeformPromptInput {
   repo: RepoConfig;
   worktree: Worktree;

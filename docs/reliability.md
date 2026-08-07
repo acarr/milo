@@ -56,6 +56,26 @@ The PR already exists; just make sure follow-up work lands on its branch: commit
 > follow-up (REMAINING-WORK B1) adds a *focused-runner* remediation cycle first ("commit, push, open
 > the PR, nothing else") so the agent can supply a better message/body before the mechanical fallback.
 
+### Invariant 2 on a REMOTE runner
+
+The [Conductor Cloud runner](./conductor.md) works in a filesystem Milo cannot read — the API exposes no
+diff, git, or file-read endpoint. The gate itself is unchanged (the runner fast-forwards the local
+worktree from the branch the remote pushed, and `resolveGroundTruth`/`ensurePr` run exactly as always),
+but the invariant splits in two and the second half is honestly weaker:
+
+> **A. Any code that reached GitHub always gets a PR.** Guaranteed absolutely — same strength, same
+> mechanism as a local run.
+>
+> **B. Code that never reached GitHub** gets a bounded self-remediation attempt (one focused "push what
+> you have" message to the same session), then a `needs-attention` job, a Linear error carrying the live
+> workspace deep link, and a workspace that is explicitly **preserved, never archived**. The guarantee
+> here is *"the work is never destroyed and a human is always told exactly where it is"* — not *"a PR
+> always exists"*.
+
+B is unavoidable rather than a shortcut: there is no API surface through which Milo could reach that
+work. It is mitigated by prompt design (push after the first commit, not only at the end) and by never
+destroying the evidence.
+
 ---
 
 ## Per-repo circuit breaker

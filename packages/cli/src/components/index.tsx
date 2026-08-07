@@ -20,6 +20,8 @@ export const STATE_COLOR: Record<string, string> = {
   done: "green",
   "discovery-done": "green",
   running: "cyan",
+  // Parked on an off-machine session — in flight, but holding no local slot.
+  "remote-waiting": "blue",
   verifying: "cyan",
   "setting-up": "cyan",
   reporting: "cyan",

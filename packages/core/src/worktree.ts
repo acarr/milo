@@ -71,7 +71,7 @@ function git(repoPath: string, args: string[], inherit = false): Promise<{ code:
  * and the loop stays responsive.
  */
 const repoGitLocks = new Map<string, Promise<unknown>>();
-function withRepoGitLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+export function withRepoGitLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
   const prev = repoGitLocks.get(repoPath) ?? Promise.resolve();
   // Run fn after prev settles (success OR failure — one job's git error must not wedge the next).
   const next = prev.then(fn, fn);
@@ -106,6 +106,12 @@ export function branchName(issueId: string, title: string): string {
  * `baseOverride` (MILO-4 stacked mode) bases the new branch off another branch on `origin` — the
  * blocker's head — instead of the repo's default base, so the dependent's PR stacks on the
  * blocker's. It must be a branch already pushed to `origin`.
+ *
+ * `opts.skipSetup` creates the worktree WITHOUT installing dependencies. Used by remote runners
+ * (Conductor Cloud), where the agent works in its own cloud workspace and this worktree exists only
+ * as the git/`gh` working directory for the verification gate — a `pnpm install` here would cost
+ * minutes for nothing, and a repo whose `setupScript` needs docker would fail setup outright for a
+ * run that never touches the local environment.
  */
 export async function createWorktree(
   repo: RepoConfig,
@@ -114,6 +120,7 @@ export async function createWorktree(
   worktreeBasePath: string,
   baseOverride?: string,
   branchOverride?: string,
+  opts: { skipSetup?: boolean } = {},
 ): Promise<Worktree> {
   const worktreePath = join(worktreeBasePath, issueId);
   const branch = branchOverride ?? branchName(issueId, title);
@@ -143,7 +150,7 @@ export async function createWorktree(
     }
   });
 
-  await runSetup(repo, worktreePath, issueId);
+  if (!opts.skipSetup) await runSetup(repo, worktreePath, issueId);
   return { path: worktreePath, branch, baseBranch: base };
 }
 

@@ -23,13 +23,13 @@ export type AddRepoResult = {
   teamKeys: string[];
   packageManager: "npm" | "pnpm" | "yarn";
   githubRepo?: string;
-  defaultRunner?: "claude" | "codex";
+  defaultRunner?: "claude" | "codex" | "conductor";
   setupScript?: string;
   teardownScript?: string;
 };
 
 const PMS = ["npm", "pnpm", "yarn"] as const;
-const RUNNERS = ["none", "claude", "codex"] as const;
+const RUNNERS = ["none", "claude", "codex", "conductor"] as const;
 
 type Step = "confirm" | "teams" | "optional";
 
@@ -78,7 +78,8 @@ export function AddRepo({
       packageManager: PMS[pmIdx]!,
     };
     if (githubRepo.trim()) result.githubRepo = githubRepo.trim();
-    if (RUNNERS[runnerIdx] !== "none") result.defaultRunner = RUNNERS[runnerIdx] as "claude" | "codex";
+    if (RUNNERS[runnerIdx] !== "none")
+      result.defaultRunner = RUNNERS[runnerIdx] as "claude" | "codex" | "conductor";
     if (setupScript.trim()) result.setupScript = setupScript.trim();
     if (teardownScript.trim()) result.teardownScript = teardownScript.trim();
     onDone(result);

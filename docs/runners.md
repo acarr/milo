@@ -1,9 +1,9 @@
 # Runners
 
-A **runner** is the agent process that actually does the coding. Milo ships two —
-**ClaudeRunner** (default) and **CodexRunner** — behind a small registry, and the `core` pipeline calls
-whichever is injected. Both use your interactive **subscription**, never API billing
-(`packages/runners/src/{claude,codex,result}.ts`).
+A **runner** is what actually does the coding. Milo ships three behind a small registry, and the
+`core` pipeline calls whichever is injected: **ClaudeRunner** (default) and **CodexRunner** run locally
+on your interactive **subscription**, never API billing; **ConductorRunner** hands the work to a
+**Conductor Cloud** workspace instead (`packages/runners/src/{claude,codex,conductor,result}.ts`).
 
 ---
 
@@ -11,8 +11,8 @@ whichever is injected. Both use your interactive **subscription**, never API bil
 
 The router (`packages/core/src/router.ts`) picks the runner in this order (first match wins):
 
-1. **Explicit tag** in the issue title/description — `[agent=claude]` or `[agent=codex]`.
-2. **Label** — `runner:claude` or `runner:codex`.
+1. **Explicit tag** in the issue title/description — `[agent=claude]`, `[agent=codex]`, or `[agent=conductor]`.
+2. **Label** — `runner:claude`, `runner:codex`, or `runner:conductor`.
 3. **Repo default** — `repositories[].defaultRunner`.
 4. **Global default** — `runnerDefaults.default` (ships `claude`).
 
@@ -22,6 +22,7 @@ The router (`packages/core/src/router.ts`) picks the runner in this order (first
 
 - Claude: `["opus", "sonnet", "haiku"]` → uses **opus**.
 - Codex: `["gpt-5.5"]` → uses **gpt-5.5**.
+- Conductor: `["opus-5-1m"]` → uses **opus-5-1m** (a per-repo `conductor.model` overrides it).
 
 > Only `chain[0]` is used today. Falling back along the chain on overload/crash is a planned follow-up
 > (REMAINING-WORK B3).
@@ -77,6 +78,22 @@ Under `-s workspace-write` Codex commits via an alternate `GIT_OBJECT_DIRECTORY`
 real `.git`), so it leaves the working tree **dirty with no branch commit**. That's fine — the
 [verification gate](./reliability.md#the-verification-gate) sees the dirty tree and commits/pushes/opens
 the PR itself. **Don't "fix" Codex's git;** the gate is the reliable backstop.
+
+---
+
+## ConductorRunner (`runConductor`) — remote
+
+Creates a Conductor Cloud workspace, sends the task as a chat message, polls the session to completion,
+then fast-forwards the local worktree from the branch the remote pushed so the ordinary verification
+gate can open the PR. **The cross-boundary contract is a branch name** — the prompt dictates the branch
+and forbids `gh pr create`, because Milo cannot see the remote filesystem and must not depend on the
+agent for the PR.
+
+The local worktree is still created but with **`skipSetup`** — it exists only as the git/`gh` working
+directory for verification, so installing dependencies there would be pure waste.
+
+See **[conductor.md](./conductor.md)** for setup, config, the polling contract, resume semantics, and
+the one place the "never leave code without a PR" guarantee is weaker.
 
 ---
 

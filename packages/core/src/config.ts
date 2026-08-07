@@ -20,7 +20,7 @@ export const RepoConfigSchema = z.object({
   routing: z.record(z.string(), z.string()).optional(),
   defaultRouting: z.string().optional(),
   // v2 additions (all optional)
-  defaultRunner: z.enum(["claude", "codex"]).optional(),
+  defaultRunner: z.enum(["claude", "codex", "conductor"]).optional(),
   promptAugmentation: z.string().optional(),
   teardownPolicy: z.enum(["always", "keep-on-failure"]).default("always"),
   // GitHub slug (owner/name) for attach-mode PR triggers; inferred from origin remote if omitted.
@@ -33,24 +33,87 @@ export const RepoConfigSchema = z.object({
       minIntervalMs: z.number().optional(),
     })
     .optional(),
+  // Per-repo Conductor Cloud settings (only read when the resolved runner is `conductor`).
+  conductor: z
+    .object({
+      /**
+       * Conductor project id (`GET /v0/projects`). Effectively REQUIRED: an organization API key
+       * launches workspaces on the org's machine, and `repositoryUrl` is rejected with
+       * INVALID_REQUEST unless that repo has been added to the machine in Conductor's org settings.
+       */
+      projectId: z.string().optional(),
+      /** Explicit override; only usable when the repo is reachable from the caller's machine. */
+      repositoryUrl: z.string().optional(),
+      /** Which agent runs inside the cloud workspace — orthogonal to Milo's runner id. */
+      agent: z.enum(["claude", "codex", "cursor"]).optional(),
+      model: z.string().optional(),
+      effort: z.enum(["none", "low", "medium", "high", "xhigh", "max", "ultra"]).optional(),
+    })
+    .optional(),
 });
 export type RepoConfig = z.infer<typeof RepoConfigSchema>;
 
 const RunnerDefaultsSchema = z
   .object({
-    default: z.enum(["claude", "codex"]).default("claude"),
+    default: z.enum(["claude", "codex", "conductor"]).default("claude"),
     claude: z
       .object({ modelChain: z.array(z.string()).default(["opus", "sonnet", "haiku"]) })
       .default({ modelChain: ["opus", "sonnet", "haiku"] }),
     codex: z
       .object({ modelChain: z.array(z.string()).default(["gpt-5.5"]) })
       .default({ modelChain: ["gpt-5.5"] }),
+    conductor: z
+      .object({ modelChain: z.array(z.string()).default(["opus-5-1m"]) })
+      .default({ modelChain: ["opus-5-1m"] }),
   })
   .default({
     default: "claude",
     claude: { modelChain: ["opus", "sonnet", "haiku"] },
     codex: { modelChain: ["gpt-5.5"] },
+    conductor: { modelChain: ["opus-5-1m"] },
   });
+
+/**
+ * Conductor Cloud — the remote runner. Milo creates a cloud workspace, sends the task as a message,
+ * polls the session to completion, then fast-forwards the local worktree from the branch the remote
+ * pushed so the ordinary verification gate can open the PR.
+ */
+const ConductorSchema = z
+  .object({
+    /**
+     * API key. Prefer `CONDUCTOR_API_KEY` in the environment or `$MILO_HOME/secrets/conductor`;
+     * this field is the plaintext fallback (same precedent as `linearToken`). See `secrets.ts`.
+     */
+    apiKey: z.string().optional(),
+    baseUrl: z.string().default("https://api.conductor.build/v0"),
+    /**
+     * Conductor's proxy rejects some default client signatures (notably Node's `undici`) with a 403
+     * that looks exactly like a bad API key — so a real User-Agent is mandatory, not cosmetic.
+     */
+    userAgent: z.string().default("milo (+https://github.com/acarr/milo)"),
+    agent: z.enum(["claude", "codex", "cursor"]).default("claude"),
+    effort: z.enum(["none", "low", "medium", "high", "xhigh", "max", "ultra"]).optional(),
+    /**
+     * How many remote sessions may be tracked at once — SEPARATE from the local `concurrency` cap.
+     * A parked remote job uses no local CPU, disk, or process (just a poll timer), so it must not
+     * consume one of the local slots; this is what stops a few long cloud runs starving local work.
+     */
+    concurrency: z.number().int().min(1).default(10),
+    /** Session poll interval. Conductor has no webhooks; their docs suggest ~15s. */
+    pollMs: z.number().int().min(2_000).default(15_000),
+    /** Give up if the session never starts a turn (workspace provisioning wedged). */
+    dispatchTimeoutMs: z.number().int().default(10 * 60_000),
+    /** Cloud workspace disposition, mirroring `repositories[].teardownPolicy`. */
+    cleanup: z
+      .object({
+        onSuccess: z.enum(["archive", "sleep", "keep"]).default("archive"),
+        onFailure: z.enum(["archive", "sleep", "keep"]).default("sleep"),
+      })
+      .default({ onSuccess: "archive", onFailure: "sleep" }),
+    /** Env vars forwarded to the cloud workspace. This ships to a third party — keep secrets out. */
+    env: z.record(z.string(), z.string()).default({}),
+  })
+  .default({});
 
 const TransportSchema = z
   .object({
@@ -127,6 +190,7 @@ export const MiloConfigSchema = z.object({
   webhook: WebhookSchema,
   dependencies: DependenciesSchema,
   progress: ProgressSchema,
+  conductor: ConductorSchema,
   transports: z
     .object({
       linear: TransportSchema,

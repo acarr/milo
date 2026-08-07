@@ -9,10 +9,11 @@ import {
   logger,
   acquireDaemonLock,
 } from "@milo/core";
-import { runClaude, runCodex, parseRunnerResult } from "@milo/runners";
+import { runClaude, runCodex, makeConductorRunner, parseRunnerResult } from "@milo/runners";
 import { startPolling } from "./poller.js";
 import { startScheduling } from "./scheduling.js";
 import { startWebhookServer } from "./webhook-server.js";
+import { startRemoteTracker } from "./remote-tracker.js";
 
 export { startPolling, pollOnce } from "./poller.js";
 export type { PollerDeps } from "./poller.js";
@@ -44,7 +45,7 @@ export async function startDaemon(): Promise<void> {
     config,
     store,
     linear,
-    runners: { claude: runClaude, codex: runCodex },
+    runners: { claude: runClaude, codex: runCodex, conductor: makeConductorRunner(config) },
     parseResult: parseRunnerResult,
   });
   // Dependency gates (MILO-4): a fire-and-forget reconcile each loop iteration promptly unblocks
@@ -72,6 +73,14 @@ export async function startDaemon(): Promise<void> {
   // Webhook accelerator (opt-in): localhost HTTP ingress; polling above still backstops.
   const stopWebhook = config.webhook.enabled ? startWebhookServer({ config, store, linear }) : () => {};
 
+  // Remote tracker: drives jobs parked on a Conductor Cloud session. These hold NO local
+  // concurrency slot (that's why they're parked), so they get their own, larger cap.
+  const stopRemoteTracker = startRemoteTracker({
+    store,
+    processJob,
+    concurrency: config.conductor.concurrency,
+  });
+
   // Lease watchdog: requeue jobs whose processing died without reaching a terminal state. Healthy
   // in-flight jobs heartbeat throughout, so only genuinely-stranded leases expire and get reclaimed.
   const watchdog = setInterval(() => {
@@ -87,6 +96,7 @@ export async function startDaemon(): Promise<void> {
     await queue.runForever(() => stop);
   } finally {
     clearInterval(watchdog);
+    stopRemoteTracker();
     stopPolling();
     scheduling.stop();
     stopWebhook();

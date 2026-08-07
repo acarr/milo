@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, accessSync, constants } from "node:fs";
-import { loadConfig, miloHome, worktreeBase, openDatabase, dbPath } from "@milo/core";
+import { loadConfig, miloHome, worktreeBase, openDatabase, dbPath, resolveConductorApiKey } from "@milo/core";
 
 export type CheckStatus = "ok" | "warn" | "fail";
 
@@ -11,12 +11,15 @@ export interface CheckResult {
   required: boolean;
 }
 
-function tryRun(cmd: string, args: string[]): { ok: boolean; out: string } {
+function tryRun(cmd: string, args: string[], input?: string): { ok: boolean; out: string } {
   try {
     const out = execFileSync(cmd, args, {
       encoding: "utf8",
       timeout: 8000,
-      stdio: ["ignore", "pipe", "pipe"],
+      // When `input` is supplied it's a secret (see the conductor check) — feed it on stdin so it
+      // never appears in argv, where any user on the box could read it out of `ps`.
+      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      ...(input === undefined ? {} : { input }),
     });
     return { ok: true, out: out.trim() };
   } catch (err) {
@@ -101,6 +104,65 @@ export function runToolChecks(): CheckResult[] {
   return results;
 }
 
+/**
+ * Conductor Cloud readiness. Verifies the key against `GET /me` and flags repos that name the
+ * conductor runner but can't actually run remotely.
+ *
+ * Kept SYNCHRONOUS because `runDoctor` is called from a React render path in the TUI — hence
+ * `curl` rather than fetch. The key goes in on stdin via `curl --config -`, never in argv.
+ */
+function conductorCheck(): CheckResult {
+  let config;
+  try {
+    config = loadConfig().config;
+  } catch {
+    return { name: "conductor", status: "warn", detail: "config unreadable", required: false };
+  }
+
+  const key = resolveConductorApiKey(config);
+  if (!key) {
+    return {
+      name: "conductor",
+      status: "warn",
+      detail: "no API key (conductor runner unavailable) — set conductor.apiKey or CONDUCTOR_API_KEY",
+      required: false,
+    };
+  }
+
+  const origin = new URL(config.conductor.baseUrl).origin;
+  const res = tryRun(
+    "curl",
+    ["-sS", "--fail-with-body", "--config", "-"],
+    `url = "${origin}/me"\nheader = "Authorization: Bearer ${key}"\nuser-agent = "${config.conductor.userAgent}"\n`,
+  );
+  if (!res.ok) {
+    return { name: "conductor", status: "fail", detail: `key rejected: ${res.out.slice(0, 160)}`, required: false };
+  }
+
+  let who = "authenticated";
+  try {
+    const me = JSON.parse(res.out) as { email?: string; organizationId?: string };
+    who = `${me.email ?? "?"} (org ${me.organizationId?.slice(0, 8) ?? "?"})`;
+  } catch {
+    /* a 200 is enough — the body shape is beta and may move */
+  }
+
+  // A conductor repo without a project id can't launch: an organization key rejects a repo that
+  // hasn't been added to the org's machine, and that error only shows up mid-job otherwise.
+  const unready = config.repositories
+    .filter((r) => r.defaultRunner === "conductor" || config.runnerDefaults.default === "conductor")
+    .filter((r) => !r.conductor?.projectId)
+    .map((r) => r.name);
+  const warn = unready.length ? ` — no conductor.projectId for: ${unready.join(", ")}` : "";
+
+  return {
+    name: "conductor",
+    status: unready.length ? "warn" : "ok",
+    detail: `${who}${warn}`,
+    required: false,
+  };
+}
+
 export function runDoctor(): CheckResult[] {
   const results: CheckResult[] = [];
 
@@ -124,6 +186,9 @@ export function runDoctor(): CheckResult[] {
 
   // 2-5. Tool checks (claude, codex, gh, docker)
   results.push(...runToolChecks());
+
+  // 5b. Conductor Cloud (optional — only matters if the conductor runner is used)
+  results.push(conductorCheck());
 
   // 6. Disk free on MILO_HOME volume
   const free = freeGiB(miloHome());
