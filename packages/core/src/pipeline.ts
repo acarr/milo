@@ -75,7 +75,16 @@ export interface RunnerFn {
     signal?: AbortSignal;
     /** Optional — existing runners and their tests are unaffected. */
     context?: RunnerContext;
-  }): Promise<{ code: number; output: string; logFile: string }>;
+  }): Promise<{
+    code: number;
+    output: string;
+    logFile: string;
+    /**
+     * Why the run did not finish cleanly, when it didn't. Distinct from `code`: a runner can die
+     * mid-response and still exit 0, so the gate needs the runner to say it outright.
+     */
+    errorDetail?: string;
+  }>;
 }
 
 export interface RunnerResultLike {
@@ -83,6 +92,8 @@ export interface RunnerResultLike {
   wroteCode: boolean;
   prUrl: string | null;
   summary: string;
+  /** Set when the `MILO_RESULT=` line existed but needed repair (or was unrecoverable). */
+  parseNote?: string;
 }
 
 /**
@@ -112,6 +123,19 @@ function routingInstruction(repo: RepoConfig, issue: LinearIssue): string {
     if (r) return r;
   }
   return repo.defaultRouting ?? "No specific routing.";
+}
+
+/**
+ * Did the run fail to finish? Returns the reason, or undefined for a clean run.
+ *
+ * The exit code alone isn't enough: `claude -p` can die mid-response (`is_error` on its terminal
+ * event) and still exit 0, and a guard that kills a lingering-but-finished CLI exits non-zero on a
+ * run that actually succeeded. So the runners report `errorDetail` explicitly and it wins.
+ */
+function runIncomplete(run: { code: number; errorDetail?: string }): { reason: string } | undefined {
+  if (run.errorDetail) return { reason: run.errorDetail };
+  if (run.code !== 0) return { reason: `the runner exited ${run.code}` };
+  return undefined;
 }
 
 function logFilePath(ref: string): string {
@@ -594,6 +618,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
     const result = parseResult(run.output);
+    if (result.parseNote) logger.warn({ jobId: job.id, ref, note: result.parseNote }, "runner result needed repair");
 
     // ---- Verification gate (never trust the self-report) ----
     store.transition(job.id, "verifying", {
@@ -603,6 +628,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       summary: result.summary,
     });
     const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       let prUrl: string;
@@ -614,8 +640,9 @@ export function makeProcessJob(deps: PipelineDeps) {
           branch: worktree.branch,
           ref,
           title: issue.title,
-          summary: result.summary || `Implements ${ref}`,
+          summary: result.summary,
           closes: ref, // Linear ticket auto-closes on merge
+          incomplete,
         });
         prUrl = ensured.prUrl;
         if (ensured.remediated) store.recordEvent(job.id, "remediation", { action: "milo-created-pr", prUrl });
@@ -625,6 +652,36 @@ export function makeProcessJob(deps: PipelineDeps) {
         fail(job, "no-pr", (err as Error).message);
         return;
       }
+
+      // A run that died mid-flight left code, so it still gets a PR (drafted, and captioned as
+      // partial by `ensurePr`) — but it must NOT be recorded as a shipped implementation. WAZ-1150
+      // did exactly that on 2026-08-07: an API error at turn 140 produced PR #707 described as
+      // "Implements WAZ-1150" and a job marked done, with nothing anywhere saying the run had died.
+      if (incomplete) {
+        store.transition(job.id, "reporting");
+        const sideKey = `${job.id}:report`;
+        if (store.alreadyDid(sideKey) === undefined) {
+          const body = `Milo's run didn't finish (${incomplete.reason}).\n\nThe partial work is preserved in a **draft** PR — it has NOT been verified and is not ready to merge: ${prUrl}`;
+          try {
+            // `agentError`, not `agentResponse`: the session must end as failed, not as a delivery.
+            if (sessionId) await linear.agentError(sessionId, body);
+            else await linear.addComment(issue.id, body);
+            store.recordSideEffect(sideKey, "report", prUrl);
+          } catch (err) {
+            logger.warn({ jobId: job.id, err: (err as Error).message }, "reporting an unfinished run to Linear failed");
+          }
+        }
+        store.transition(job.id, "needs-attention", {
+          verified_outcome: "incomplete",
+          pr_url: prUrl,
+          failure_class: "runner-crash",
+          failure_detail: incomplete.reason,
+        });
+        logger.warn({ jobId: job.id, ref, prUrl, reason: incomplete.reason }, "run did not finish — draft PR, needs attention");
+        teardownIfNeeded(repo, worktree.path, false);
+        return;
+      }
+
       await reportLinear(job, issue, teamKey, sessionId, { kind: "implemented", prUrl, summary: result.summary });
       store.transition(job.id, "done", { verified_outcome: "implemented", pr_url: prUrl });
       store.recordRepoSuccess(repo.name);
@@ -632,7 +689,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    if (result.outcome === "discovery" && run.code === 0) {
+    if (result.outcome === "discovery" && !incomplete) {
       await reportLinear(job, issue, teamKey, sessionId, { kind: "discovery", summary: result.summary });
       store.transition(job.id, "discovery-done", { verified_outcome: "discovery" });
       store.recordRepoSuccess(repo.name);
@@ -640,14 +697,13 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    const detail =
-      run.code !== 0 ? `runner exited ${run.code}` : `declared ${result.outcome} but no code was produced`;
+    const detail = incomplete ? incomplete.reason : `declared ${result.outcome} but no code was produced`;
     const willRetry = job.attempts + 1 < job.maxAttempts;
     if (sessionId) {
       if (willRetry) thought(`Hit a snag (${detail}); retrying with a fresh worktree.`);
       else await linear.agentError(sessionId, `Milo couldn't complete this: ${detail}.`);
     }
-    fail(job, run.code !== 0 ? "runner-crash" : "wrong-outcome", detail, () =>
+    fail(job, incomplete ? "runner-crash" : "wrong-outcome", detail, () =>
       teardownIfNeeded(repo, worktree.path, false, true),
     );
   }
@@ -838,6 +894,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
     const result = parseResult(run.output);
+    if (result.parseNote) logger.warn({ jobId: job.id, ref, note: result.parseNote }, "runner result needed repair");
 
     store.transition(job.id, "verifying", {
       declared_outcome: result.outcome,
@@ -846,17 +903,46 @@ export function makeProcessJob(deps: PipelineDeps) {
       summary: result.summary,
     });
     const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       // Push follow-up commits to the EXISTING branch — the open PR updates itself.
       if (!gt.pushed || gt.dirty) store.transition(job.id, "remediating");
-      const pushed = ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, `${ref}: follow-up`);
+      const message = incomplete ? `${ref}: follow-up (partial — run did not finish)` : `${ref}: follow-up`;
+      const pushed = ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
       if (!pushed.pushed) {
         if (sessionId) await linear.agentError(sessionId, `Milo made changes but couldn't push the follow-up to the PR branch.`);
         fail(job, "no-pr", "failed to push follow-up commits to the PR branch");
         return;
       }
       if (pushed.committed) store.recordEvent(job.id, "remediation", { action: "milo-pushed-followup" });
+
+      // Same rule as create mode: pushed, but not delivered. The PR already exists and is the
+      // user's, so the revision can't be drafted — the session error is what carries the warning.
+      if (incomplete) {
+        store.transition(job.id, "reporting");
+        const sideKey = `${job.id}:report`;
+        if (store.alreadyDid(sideKey) === undefined) {
+          const body = `Milo's revision didn't finish (${incomplete.reason}).\n\nPartial work has been pushed to ${prior.prUrl} so it isn't lost, but it has NOT been verified — review it before merging.`;
+          try {
+            if (sessionId) await linear.agentError(sessionId, body);
+            else await linear.addComment(issue.id, body);
+            store.recordSideEffect(sideKey, "report", prior.prUrl);
+          } catch (err) {
+            logger.warn({ jobId: job.id, err: (err as Error).message }, "reporting an unfinished revision to Linear failed");
+          }
+        }
+        store.transition(job.id, "needs-attention", {
+          verified_outcome: "incomplete",
+          pr_url: prior.prUrl,
+          failure_class: "runner-crash",
+          failure_detail: incomplete.reason,
+        });
+        logger.warn({ jobId: job.id, ref, prUrl: prior.prUrl, reason: incomplete.reason }, "revision did not finish — needs attention");
+        teardownIfNeeded(repo, worktree.path, false);
+        return;
+      }
+
       await reportLinear(job, issue, teamKey, sessionId, { kind: "followup", prUrl: prior.prUrl, summary: result.summary });
       store.transition(job.id, "done", { verified_outcome: "implemented", pr_url: prior.prUrl });
       store.recordRepoSuccess(repo.name);
@@ -864,7 +950,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    if (result.outcome === "discovery" && run.code === 0) {
+    if (result.outcome === "discovery" && !incomplete) {
       // No code change needed (e.g. the comment was a question Milo answered in the summary).
       await reportLinear(job, issue, teamKey, sessionId, { kind: "discovery", summary: result.summary });
       store.transition(job.id, "discovery-done", { verified_outcome: "discovery", pr_url: prior.prUrl });
@@ -873,13 +959,13 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    const detail = run.code !== 0 ? `runner exited ${run.code}` : `declared ${result.outcome} but no code was produced`;
+    const detail = incomplete ? incomplete.reason : `declared ${result.outcome} but no code was produced`;
     const willRetry = job.attempts + 1 < job.maxAttempts;
     if (sessionId) {
       if (willRetry) thought(`Hit a snag (${detail}); retrying the revision.`);
       else await linear.agentError(sessionId, `Milo couldn't complete this revision: ${detail}.`);
     }
-    fail(job, run.code !== 0 ? "runner-crash" : "wrong-outcome", detail, () =>
+    fail(job, incomplete ? "runner-crash" : "wrong-outcome", detail, () =>
       teardownIfNeeded(repo!, worktree!.path, false, true),
     );
   }
@@ -972,6 +1058,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
     const result = parseResult(run.output);
+    if (result.parseNote) logger.warn({ jobId: job.id, ref, note: result.parseNote }, "runner result needed repair");
 
     store.transition(job.id, "verifying", {
       declared_outcome: result.outcome,
@@ -980,16 +1067,44 @@ export function makeProcessJob(deps: PipelineDeps) {
       summary: result.summary,
     });
     const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       // Update the EXISTING PR — push follow-up commits, never open a second PR.
       if (!gt.pushed || gt.dirty) store.transition(job.id, "remediating");
-      const pushed = ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, `${ref}: follow-up`);
+      const message = incomplete ? `${ref}: follow-up (partial — run did not finish)` : `${ref}: follow-up`;
+      const pushed = ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
       if (!pushed.pushed) {
         fail(job, "no-pr", "failed to push follow-up commits to the PR branch");
         return;
       }
       if (pushed.committed) store.recordEvent(job.id, "remediation", { action: "milo-pushed-followup" });
+
+      // Same rule as create mode: a run that died still pushes (the work exists) but must not be
+      // reported as a delivered follow-up. Attach mode can't draft — the PR is someone else's — so
+      // the comment carries the warning instead.
+      if (incomplete) {
+        store.transition(job.id, "reporting");
+        const sideKey = `${job.id}:report`;
+        if (store.alreadyDid(sideKey) === undefined) {
+          addPrComment(
+            slug,
+            number,
+            `⚠️ **Milo's run didn't finish** (${incomplete.reason}).\n\nPartial work has been pushed to this branch so it isn't lost, but it has NOT been verified — review it before merging.`,
+          );
+          store.recordSideEffect(sideKey, "report", pr.url);
+        }
+        store.transition(job.id, "needs-attention", {
+          verified_outcome: "incomplete",
+          pr_url: pr.url,
+          failure_class: "runner-crash",
+          failure_detail: incomplete.reason,
+        });
+        logger.warn({ jobId: job.id, ref, prUrl: pr.url, reason: incomplete.reason }, "attach run did not finish — needs attention");
+        teardownIfNeeded(repo, worktree.path, false);
+        return;
+      }
+
       await reportGithub(job, slug, number, { kind: "implemented", summary: result.summary, prUrl: pr.url });
       store.transition(job.id, "done", { verified_outcome: "implemented", pr_url: pr.url });
       store.recordRepoSuccess(repo.name);
@@ -997,7 +1112,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    if (result.outcome === "discovery" && run.code === 0) {
+    if (result.outcome === "discovery" && !incomplete) {
       await reportGithub(job, slug, number, { kind: "discovery", summary: result.summary, prUrl: pr.url });
       store.transition(job.id, "discovery-done", { verified_outcome: "discovery", pr_url: pr.url });
       store.recordRepoSuccess(repo.name);
@@ -1005,9 +1120,8 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    const detail =
-      run.code !== 0 ? `runner exited ${run.code}` : `declared ${result.outcome} but no code was produced`;
-    fail(job, run.code !== 0 ? "runner-crash" : "wrong-outcome", detail, () =>
+    const detail = incomplete ? incomplete.reason : `declared ${result.outcome} but no code was produced`;
+    fail(job, incomplete ? "runner-crash" : "wrong-outcome", detail, () =>
       teardownIfNeeded(repo!, worktree!.path, false, true),
     );
   }
@@ -1088,6 +1202,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
     const result = parseResult(run.output);
+    if (result.parseNote) logger.warn({ jobId: job.id, ref, note: result.parseNote }, "runner result needed repair");
 
     store.transition(job.id, "verifying", {
       declared_outcome: result.outcome,
@@ -1096,6 +1211,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       summary: result.summary,
     });
     const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       let prUrl: string;
@@ -1107,13 +1223,25 @@ export function makeProcessJob(deps: PipelineDeps) {
           branch: worktree.branch,
           ref,
           title: `Scheduled task: ${ref}`,
-          summary: result.summary || `Scheduled task: ${ref}`,
+          summary: result.summary,
           // No ticket to auto-close — omit the `Closes` line.
+          incomplete,
         });
         prUrl = ensured.prUrl;
         if (ensured.remediated) store.recordEvent(job.id, "remediation", { action: "milo-created-pr", prUrl });
       } catch (err) {
         fail(job, "no-pr", (err as Error).message);
+        return;
+      }
+      if (incomplete) {
+        store.transition(job.id, "needs-attention", {
+          verified_outcome: "incomplete",
+          pr_url: prUrl,
+          failure_class: "runner-crash",
+          failure_detail: incomplete.reason,
+        });
+        logger.warn({ jobId: job.id, schedule: ref, prUrl, reason: incomplete.reason }, "scheduled prompt did not finish — draft PR");
+        teardownIfNeeded(repo, worktree.path, false);
         return;
       }
       store.transition(job.id, "done", { verified_outcome: "implemented", pr_url: prUrl });
@@ -1123,7 +1251,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    if (result.outcome === "discovery" && run.code === 0) {
+    if (result.outcome === "discovery" && !incomplete) {
       store.transition(job.id, "discovery-done", { verified_outcome: "discovery" });
       store.recordRepoSuccess(repo.name);
       logger.info({ jobId: job.id, schedule: ref, summary: result.summary }, "scheduled prompt ran (no code change)");
@@ -1131,9 +1259,8 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    const detail =
-      run.code !== 0 ? `runner exited ${run.code}` : `declared ${result.outcome} but no code was produced`;
-    fail(job, run.code !== 0 ? "runner-crash" : "wrong-outcome", detail, () =>
+    const detail = incomplete ? incomplete.reason : `declared ${result.outcome} but no code was produced`;
+    fail(job, incomplete ? "runner-crash" : "wrong-outcome", detail, () =>
       teardownIfNeeded(repo, worktree!.path, false, true),
     );
   }
@@ -1192,12 +1319,15 @@ export function makeProcessJob(deps: PipelineDeps) {
     // followups happen repeatedly on one ticket — scope the idempotency key per job, not per report.
     const sideKey = `${job.id}:report`;
     if (store.alreadyDid(sideKey) !== undefined) return;
+    // An empty summary means the agent's MILO_RESULT line was missing or unrecoverable. Say that,
+    // rather than posting a report whose body is nothing but a bare link (WAZ-1107, 2026-08-06).
+    const summary = r.summary.trim() || "_The agent didn't leave a summary — see the PR description for what changed._";
     const body =
       r.kind === "followup" && r.prUrl
-        ? `Milo pushed a follow-up to the PR (${r.prUrl}):\n\n${r.summary}`
+        ? `Milo pushed a follow-up to the PR (${r.prUrl}):\n\n${summary}`
         : r.kind === "implemented" && r.prUrl
-          ? `Milo submitted a PR for this ticket: ${r.prUrl}\n\n${r.summary}`
-          : `Milo investigated this ticket (no code change required):\n\n${r.summary}`;
+          ? `Milo submitted a PR for this ticket: ${r.prUrl}\n\n${summary}`
+          : `Milo investigated this ticket (no code change required):\n\n${summary}`;
     try {
       // When the issue was delegated to the agent, the canonical reply is the agent-session
       // "response" (which also completes the chat). Otherwise fall back to an issue comment.

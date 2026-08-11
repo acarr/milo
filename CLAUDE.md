@@ -23,7 +23,9 @@ database, operations).
   retry/backoff, crash recovery, a per-repo circuit breaker, and a lease watchdog that requeues jobs
   whose worker died.
 - **Verification gate** — never trusts the agent's self-report; resolves real git/`gh` state and opens
-  the PR itself if code was written but no PR exists. Discovery-only work correctly produces no PR.
+  the PR itself if code was written but no PR exists, writing a description from the commits + diffstat
+  rather than relying on the agent's summary. Discovery-only work correctly produces no PR. A run that
+  didn't finish still gets its work preserved, but as a **draft** PR + `needs-attention`, never `done`.
 - **Linear agent chat** — drives the agent-session transcript (thought → action → response) with live,
   throttled progress streaming; **revise mode** re-runs a delegated ticket against its existing branch
   instead of opening a second PR.
@@ -72,6 +74,15 @@ Key design points:
   (CLI standalone) and `runForever()` (daemon) share it.
 - **Verification gate** (verify.ts): never trust the agent's self-report — resolve real git/`gh` state;
   if code was written but no PR exists, Milo opens it. No code + genuine discovery → no PR.
+  `buildPrBody` writes the description from the branch's commits + diffstat, treating the agent's
+  `MILO_RESULT` summary as a bonus — so a missing summary costs detail, not the whole description.
+- **A run that didn't finish is not a shipped run**: the runners report `errorDetail` (a terminal
+  `is_error` event, or a guard kill before any result) and `runIncomplete` in pipeline.ts wins over
+  the exit code — `claude -p` can die mid-response and still exit 0. All four finalize paths (Linear
+  create / Linear revise / GitHub attach / scheduled prompt) then preserve the work but land the job
+  in `needs-attention` with `verified_outcome=incomplete`, never `done`. In create mode the PR is
+  opened as a **draft** titled `[incomplete] …`; in attach mode (someone else's PR) the warning goes
+  in the comment instead.
 - **Runner injection**: `core` stays runner-agnostic — `makeProcessJob({ runner })` takes the runner as a
   function, so `core` never imports `@milo/runners` (no cycle). CLI/daemon inject `runClaude`/`runCodex`.
 - **Daemon + CLI share the SQLite DB** across processes (WAL + `busy_timeout=5000`). The TUI/CLI read it
@@ -188,6 +199,16 @@ pnpm test             # node --test via tsx; queue + TUI + core/runner tests
 - **Org Conductor API keys need `projectId`.** `repositoryUrl` is rejected unless the repo has been
   added to the org's Cloud computer in Conductor's settings. Also: send a real `User-Agent` — their
   proxy 403s default client signatures, which looks exactly like a bad API key.
+- **A Conductor resume must replay the WHOLE transcript**, not just what's past the saved cursor:
+  `output` starts empty on every invocation, so draining from the cursor rebuilds nothing, and a
+  second resume (the first already consumed the messages) would finalize on an empty output and lose
+  the agent's `MILO_RESULT` entirely. The replay is silent — `replaying` mutes emit/echo/log/persist
+  so it doesn't repost the run's narration to Linear or rewind the durable cursor.
+- **`MILO_RESULT` parsing is forgiving on purpose** (result.ts): a clean run's final line can arrive
+  truncated one character short (missing `}`), so the parser repairs a cut-off tail and then scrapes
+  fields by regex before giving up. Losing the summary silently is worse than a slightly wrong one —
+  it used to degrade a 450-char summary to `""` with nothing logged. Failures set `parseNote`, which
+  the pipeline logs.
 - **Codex git sandbox**: under `-s workspace-write`, Codex commits via an alternate
   `GIT_OBJECT_DIRECTORY` (it can't touch the real `.git`), so the working tree is left dirty with no
   branch commit. That's fine — **the verification gate** sees the dirty tree and commits/pushes/opens the
