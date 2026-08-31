@@ -117,7 +117,7 @@ test("ensurePushed pushes detached-worktree commits to the PR branch by refspec"
   writeFileSync(join(wt.path, "followup.txt"), "revision requested in PR feedback\n");
 
   const before = sh("git", ["-C", origin, "rev-parse", `refs/heads/${FEATURE}`]);
-  const result = ensurePushed(wt.path, "main", FEATURE, "TEST-1: follow-up");
+  const result = await ensurePushed(wt.path, "main", FEATURE, "TEST-1: follow-up");
   assert.equal(result.pushed, true, "push succeeds from a detached worktree");
   assert.equal(result.committed, true, "the dirty change was committed");
 

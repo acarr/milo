@@ -627,14 +627,14 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
     });
-    const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
     const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       let prUrl: string;
       try {
         if (!gt.prUrl) store.transition(job.id, "remediating");
-        const ensured = ensurePr({
+        const ensured = await ensurePr({
           worktreePath: worktree.path,
           baseBranch: worktree.baseBranch,
           branch: worktree.branch,
@@ -902,14 +902,14 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
     });
-    const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
     const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       // Push follow-up commits to the EXISTING branch — the open PR updates itself.
       if (!gt.pushed || gt.dirty) store.transition(job.id, "remediating");
       const message = incomplete ? `${ref}: follow-up (partial — run did not finish)` : `${ref}: follow-up`;
-      const pushed = ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
+      const pushed = await ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
       if (!pushed.pushed) {
         if (sessionId) await linear.agentError(sessionId, `Milo made changes but couldn't push the follow-up to the PR branch.`);
         fail(job, "no-pr", "failed to push follow-up commits to the PR branch");
@@ -1066,14 +1066,14 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
     });
-    const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
     const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       // Update the EXISTING PR — push follow-up commits, never open a second PR.
       if (!gt.pushed || gt.dirty) store.transition(job.id, "remediating");
       const message = incomplete ? `${ref}: follow-up (partial — run did not finish)` : `${ref}: follow-up`;
-      const pushed = ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
+      const pushed = await ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
       if (!pushed.pushed) {
         fail(job, "no-pr", "failed to push follow-up commits to the PR branch");
         return;
@@ -1210,14 +1210,14 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
     });
-    const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
     const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       let prUrl: string;
       try {
         if (!gt.prUrl) store.transition(job.id, "remediating");
-        const ensured = ensurePr({
+        const ensured = await ensurePr({
           worktreePath: worktree.path,
           baseBranch: worktree.baseBranch,
           branch: worktree.branch,

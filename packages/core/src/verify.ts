@@ -1,9 +1,23 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { logger } from "./logger.js";
 
-function sh(cmd: string, args: string[], cwd: string): { code: number; out: string } {
-  const r = spawnSync(cmd, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  return { code: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
+/**
+ * Run a child process WITHOUT blocking the event loop. The gate's work is network-bound —
+ * `git push`, `gh pr list`, `gh pr create` — and every job finalize runs several. Under `spawnSync`
+ * that froze the single daemon event loop for the whole sequence, starving the job heartbeat and the
+ * webhook server (a Linear delegation POST would connect and then never get a reply). Same reasoning
+ * as `worktree.ts`'s `run` and `github.ts`'s `gh`.
+ */
+function sh(cmd: string, args: string[], cwd: string): Promise<{ code: number; out: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout?.on("data", (d: Buffer) => (out += d.toString()));
+    child.stderr?.on("data", (d: Buffer) => (out += d.toString()));
+    // `error` fires when the binary can't be spawned (e.g. ENOENT) — mirror spawnSync's failure shape.
+    child.on("error", (e) => resolve({ code: 1, out: `${out}${e.message}`.trim() }));
+    child.on("close", (code) => resolve({ code: code ?? 1, out: out.trim() }));
+  });
 }
 const git = (wt: string, args: string[]) => sh("git", args, wt);
 const gh = (wt: string, args: string[]) => sh("gh", args, wt);
@@ -18,24 +32,29 @@ export interface GroundTruth {
 }
 
 /** Resolve the real state of the worktree/branch — never trust the agent's self-report. */
-export function resolveGroundTruth(worktreePath: string, baseBranch: string, branch: string): GroundTruth {
-  const countAhead = () => {
-    let r = git(worktreePath, ["rev-list", "--count", `origin/${baseBranch}..HEAD`]);
-    if (r.code !== 0) r = git(worktreePath, ["rev-list", "--count", `${baseBranch}..HEAD`]);
+export async function resolveGroundTruth(
+  worktreePath: string,
+  baseBranch: string,
+  branch: string,
+): Promise<GroundTruth> {
+  const countAhead = async () => {
+    let r = await git(worktreePath, ["rev-list", "--count", `origin/${baseBranch}..HEAD`]);
+    if (r.code !== 0) r = await git(worktreePath, ["rev-list", "--count", `${baseBranch}..HEAD`]);
     const n = parseInt(r.out, 10);
     return Number.isFinite(n) ? n : 0;
   };
-  const commitsAhead = countAhead();
-  const dirty = git(worktreePath, ["status", "--porcelain"]).out !== "";
+  const commitsAhead = await countAhead();
+  const dirty = (await git(worktreePath, ["status", "--porcelain"])).out !== "";
 
-  const hasUpstream = git(worktreePath, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).code === 0;
+  const hasUpstream =
+    (await git(worktreePath, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])).code === 0;
   let pushed = false;
   if (hasUpstream) {
-    const ahead = parseInt(git(worktreePath, ["rev-list", "--count", "@{u}..HEAD"]).out, 10);
+    const ahead = parseInt((await git(worktreePath, ["rev-list", "--count", "@{u}..HEAD"])).out, 10);
     pushed = Number.isFinite(ahead) ? ahead === 0 : false;
   }
 
-  const prRes = gh(worktreePath, ["pr", "list", "--head", branch, "--state", "all", "--json", "url,state"]);
+  const prRes = await gh(worktreePath, ["pr", "list", "--head", branch, "--state", "all", "--json", "url,state"]);
   let prUrl: string | null = null;
   let prState: string | null = null;
   if (prRes.code === 0) {
@@ -66,18 +85,23 @@ export interface EnsurePushedResult {
  * branch is checked out elsewhere): detached HEAD can't push as plain `HEAD`, so commits are pushed
  * to the PR branch by refspec (`HEAD:refs/heads/<branch>`).
  */
-export function ensurePushed(worktreePath: string, baseBranch: string, branch: string, message: string): EnsurePushedResult {
-  const gt = resolveGroundTruth(worktreePath, baseBranch, branch);
+export async function ensurePushed(
+  worktreePath: string,
+  baseBranch: string,
+  branch: string,
+  message: string,
+): Promise<EnsurePushedResult> {
+  const gt = await resolveGroundTruth(worktreePath, baseBranch, branch);
   let committed = false;
   if (gt.dirty) {
-    git(worktreePath, ["add", "-A"]);
-    const c = git(worktreePath, ["commit", "-m", message]);
+    await git(worktreePath, ["add", "-A"]);
+    const c = await git(worktreePath, ["commit", "-m", message]);
     committed = c.code === 0;
     if (!committed) logger.warn({ out: c.out }, "commit during attach push reported an issue");
   }
-  const detached = git(worktreePath, ["symbolic-ref", "-q", "HEAD"]).code !== 0;
+  const detached = (await git(worktreePath, ["symbolic-ref", "-q", "HEAD"])).code !== 0;
   const target = detached ? `HEAD:refs/heads/${branch}` : "HEAD";
-  const push = git(worktreePath, ["push", "origin", target]);
+  const push = await git(worktreePath, ["push", "origin", target]);
   if (push.code !== 0) {
     logger.warn({ out: push.out }, "push during attach reported an issue");
     return { pushed: false, committed };
@@ -108,18 +132,18 @@ export interface EnsurePrResult {
 }
 
 /** Commit subjects on `branch` that aren't on the base, oldest first. */
-function commitSubjects(worktreePath: string, baseBranch: string): string[] {
+async function commitSubjects(worktreePath: string, baseBranch: string): Promise<string[]> {
   for (const base of [`origin/${baseBranch}`, baseBranch]) {
-    const r = git(worktreePath, ["log", "--reverse", "--format=%s", `${base}..HEAD`]);
+    const r = await git(worktreePath, ["log", "--reverse", "--format=%s", `${base}..HEAD`]);
     if (r.code === 0) return r.out.split("\n").map((l) => l.trim()).filter(Boolean);
   }
   return [];
 }
 
 /** `28 files changed, 11895 insertions(+), 393 deletions(-)` — or undefined if git can't say. */
-function diffStat(worktreePath: string, baseBranch: string): string | undefined {
+async function diffStat(worktreePath: string, baseBranch: string): Promise<string | undefined> {
   for (const base of [`origin/${baseBranch}`, baseBranch]) {
-    const r = git(worktreePath, ["diff", "--shortstat", `${base}...HEAD`]);
+    const r = await git(worktreePath, ["diff", "--shortstat", `${base}...HEAD`]);
     if (r.code === 0 && r.out) return r.out;
   }
   return undefined;
@@ -135,14 +159,14 @@ const MAX_LISTED_COMMITS = 20;
  * nothing but `Implements WAZ-1150`. So the body is grounded in what git can prove happened
  * (commits, diffstat) and treats the agent's summary as a bonus rather than the whole story.
  */
-export function buildPrBody(input: {
+export async function buildPrBody(input: {
   worktreePath: string;
   baseBranch: string;
   ref: string;
   summary: string;
   closes?: string;
   incomplete?: { reason: string };
-}): string {
+}): Promise<string> {
   const { worktreePath, baseBranch, ref, summary, closes, incomplete } = input;
   const parts: string[] = [];
 
@@ -158,14 +182,14 @@ export function buildPrBody(input: {
 
   parts.push(`## Summary\n\n${summary.trim() || `Milo's agent left no summary for ${ref}. What it changed, from git:`}`);
 
-  const commits = commitSubjects(worktreePath, baseBranch);
+  const commits = await commitSubjects(worktreePath, baseBranch);
   if (commits.length) {
     const listed = commits.slice(0, MAX_LISTED_COMMITS).map((c) => `- ${c}`);
     if (commits.length > MAX_LISTED_COMMITS) listed.push(`- …and ${commits.length - MAX_LISTED_COMMITS} more`);
     parts.push(`## Commits\n\n${listed.join("\n")}`);
   }
 
-  const stat = diffStat(worktreePath, baseBranch);
+  const stat = await diffStat(worktreePath, baseBranch);
   if (stat) parts.push(`## Files changed\n\n${stat}`);
 
   if (closes) parts.push(`Closes ${closes}`);
@@ -178,25 +202,25 @@ export function buildPrBody(input: {
  * Otherwise Milo commits (if dirty), pushes (if needed), and opens the PR itself — so code is
  * never left without a PR (the classic failure mode of naive coding agents), with no dependence on the model.
  */
-export function ensurePr(input: EnsurePrInput): EnsurePrResult {
+export async function ensurePr(input: EnsurePrInput): Promise<EnsurePrResult> {
   const { worktreePath, baseBranch, branch, ref, title, summary, closes, incomplete } = input;
-  const gt = resolveGroundTruth(worktreePath, baseBranch, branch);
+  const gt = await resolveGroundTruth(worktreePath, baseBranch, branch);
   if (gt.prUrl) return { prUrl: gt.prUrl, remediated: false };
 
   logger.warn({ ref, branch, incomplete: incomplete?.reason }, "code present but no PR — Milo is opening it directly");
 
   if (gt.dirty) {
-    git(worktreePath, ["add", "-A"]);
+    await git(worktreePath, ["add", "-A"]);
     const message = incomplete ? `${ref}: ${title} (partial — run did not finish)` : `${ref}: ${title}`;
-    const c = git(worktreePath, ["commit", "-m", message]);
+    const c = await git(worktreePath, ["commit", "-m", message]);
     if (c.code !== 0) logger.warn({ out: c.out }, "commit during remediation reported an issue");
   }
-  const push = git(worktreePath, ["push", "-u", "origin", "HEAD"]);
+  const push = await git(worktreePath, ["push", "-u", "origin", "HEAD"]);
   if (push.code !== 0) logger.warn({ out: push.out }, "push during remediation reported an issue");
 
   // Built AFTER the commit above, so the diffstat and commit list describe everything being shipped.
-  const body = buildPrBody({ worktreePath, baseBranch, ref, summary, closes, incomplete });
-  const create = gh(worktreePath, [
+  const body = await buildPrBody({ worktreePath, baseBranch, ref, summary, closes, incomplete });
+  const create = await gh(worktreePath, [
     "pr",
     "create",
     "--base",
@@ -212,7 +236,7 @@ export function ensurePr(input: EnsurePrInput): EnsurePrResult {
   const urlMatch = create.out.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
   if (!urlMatch) {
     // Re-resolve in case the PR was actually created but output parsing failed.
-    const again = resolveGroundTruth(worktreePath, baseBranch, branch);
+    const again = await resolveGroundTruth(worktreePath, baseBranch, branch);
     if (again.prUrl) return { prUrl: again.prUrl, remediated: true };
     throw new Error(`Failed to open PR during remediation: ${create.out}`);
   }

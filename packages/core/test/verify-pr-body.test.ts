@@ -41,9 +41,9 @@ function repoWithBranch(commits: string[]): { path: string; baseBranch: string }
   return { path, baseBranch: "main" };
 }
 
-test("a body with a summary still reports the commits and diffstat git can prove", () => {
+test("a body with a summary still reports the commits and diffstat git can prove", async () => {
   const { path, baseBranch } = repoWithBranch(["feat: add the widget", "test: cover the widget"]);
-  const body = buildPrBody({
+  const body = await buildPrBody({
     worktreePath: path,
     baseBranch,
     ref: "TST-1",
@@ -60,9 +60,9 @@ test("a body with a summary still reports the commits and diffstat git can prove
   assert.ok(!body.includes("[!WARNING]"), "a clean run carries no warning");
 });
 
-test("no summary still yields a description of the work, not just `Implements <REF>`", () => {
+test("no summary still yields a description of the work, not just `Implements <REF>`", async () => {
   const { path, baseBranch } = repoWithBranch(["fix(api): stop leaking friends-only ratings"]);
-  const body = buildPrBody({ worktreePath: path, baseBranch, ref: "TST-2", summary: "", closes: "TST-2" });
+  const body = await buildPrBody({ worktreePath: path, baseBranch, ref: "TST-2", summary: "", closes: "TST-2" });
 
   assert.match(body, /left no summary/, "it says the summary is missing rather than pretending");
   assert.match(body, /- fix\(api\): stop leaking friends-only ratings/, "the commits carry the description");
@@ -70,9 +70,9 @@ test("no summary still yields a description of the work, not just `Implements <R
   assert.ok(body.length > 120, `body should be substantive, got ${body.length} chars`);
 });
 
-test("an unfinished run is captioned as such, up front", () => {
+test("an unfinished run is captioned as such, up front", async () => {
   const { path, baseBranch } = repoWithBranch(["feat: half of the moderation work"]);
-  const body = buildPrBody({
+  const body = await buildPrBody({
     worktreePath: path,
     baseBranch,
     ref: "TST-3",
@@ -88,18 +88,18 @@ test("an unfinished run is captioned as such, up front", () => {
   assert.match(body, /- feat: half of the moderation work/, "partial work is still described");
 });
 
-test("a long branch lists a bounded number of commits and says how many were elided", () => {
+test("a long branch lists a bounded number of commits and says how many were elided", async () => {
   const subjects = Array.from({ length: 25 }, (_, i) => `chore: step ${i + 1}`);
   const { path, baseBranch } = repoWithBranch(subjects);
-  const body = buildPrBody({ worktreePath: path, baseBranch, ref: "TST-4", summary: "Many steps." });
+  const body = await buildPrBody({ worktreePath: path, baseBranch, ref: "TST-4", summary: "Many steps." });
 
   assert.match(body, /- chore: step 1$/m, "oldest first");
   assert.match(body, /…and 5 more/);
   assert.ok(!body.includes("chore: step 25"), "the tail is elided, not printed");
 });
 
-test("a worktree git can't read degrades to the summary instead of throwing", () => {
-  const body = buildPrBody({
+test("a worktree git can't read degrades to the summary instead of throwing", async () => {
+  const body = await buildPrBody({
     worktreePath: mkdtempSync(join(os.tmpdir(), "milo-not-a-repo-")),
     baseBranch: "main",
     ref: "TST-5",
