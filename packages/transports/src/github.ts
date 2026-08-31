@@ -20,6 +20,27 @@ function actorAllowed(config: MiloConfig, actor: string | undefined): boolean {
   return actor ? allow.includes(actor) : false;
 }
 
+/** How many PR-comment fetches may be in flight at once (see the call site for why it is bounded). */
+const COMMENT_FETCH_CONCURRENCY = 8;
+
+/** `Promise.all`-style map with an upper bound on in-flight work; results keep input order. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 /**
  * Poll configured repos for open PRs that ask for Milo: a `milo` label, or a `@milo` mention in
  * a comment. Each becomes an attach-mode JobIntent. The contentHash carries the trigger signature
@@ -34,15 +55,23 @@ export async function pollGithub(config: MiloConfig): Promise<JobIntent[]> {
     if (!slug) continue;
     let prs;
     try {
-      prs = listOpenPrs(slug);
+      prs = await listOpenPrs(slug);
     } catch (err) {
       logger.warn({ slug, err: (err as Error).message }, "github poll failed");
       continue;
     }
 
-    for (const pr of prs) {
+    // One `gh api .../comments` round-trip per unlabeled PR. Sequentially that is ~0.5s * every open
+    // PR in every configured repo, every cycle — so fetch them with bounded concurrency instead. The
+    // bound keeps us from opening dozens of sockets (and tripping GitHub's secondary rate limits) at
+    // once, while the poll still finishes in seconds rather than a minute.
+    const commentsByPr = await mapWithConcurrency(prs, COMMENT_FETCH_CONCURRENCY, async (pr) =>
+      pr.labels.some((l) => l.toLowerCase() === TRIGGER_LABEL) ? [] : prComments(slug, pr.number),
+    );
+
+    for (const [i, pr] of prs.entries()) {
       const hasLabel = pr.labels.some((l) => l.toLowerCase() === TRIGGER_LABEL);
-      const mentions = (hasLabel ? [] : prComments(slug, pr.number)).filter((c) => MENTION.test(c.body));
+      const mentions = commentsByPr[i]!.filter((c) => MENTION.test(c.body));
       const latestMention = mentions[mentions.length - 1];
 
       if (!hasLabel && !latestMention) continue;

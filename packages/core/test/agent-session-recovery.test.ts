@@ -10,9 +10,12 @@ const node = (status: string, opts: { appUserId?: string; issue?: string | null 
   issue: opts.issue === null ? undefined : { identifier: opts.issue ?? "SBX-1" },
 });
 
-test("the poll backstop reclaims pending AND errored sessions (recovers dropped delegations)", () => {
+test("the poll backstop reclaims pending, errored AND stale sessions (recovers dropped delegations)", () => {
   assert.ok(isRecoverableAgentSession(node("pending"), ME));
   assert.ok(isRecoverableAgentSession(node("error"), ME), "an errored session must be recoverable");
+  // `stale` is what Linear leaves behind when the delegation webhook was never answered — a blocked
+  // daemon or a dead tunnel. It is precisely the case the poll backstop exists to recover.
+  assert.ok(isRecoverableAgentSession(node("stale"), ME), "a stale session must be recoverable");
 });
 
 test("non-recoverable statuses are excluded", () => {
@@ -26,6 +29,6 @@ test("sessions owned by another app user, or with no issue, are excluded", () =>
   assert.equal(isRecoverableAgentSession(node("error", { issue: null }), ME), false);
 });
 
-test("the recoverable set is exactly pending + error", () => {
-  assert.deepEqual([...RECOVERABLE_AGENT_SESSION_STATUSES].sort(), ["error", "pending"]);
+test("the recoverable set is exactly pending + error + stale", () => {
+  assert.deepEqual([...RECOVERABLE_AGENT_SESSION_STATUSES].sort(), ["error", "pending", "stale"]);
 });
