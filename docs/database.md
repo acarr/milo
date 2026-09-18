@@ -42,9 +42,13 @@ One row per unit of work. Primary key `id`; **unique** on `identity_key`.
 | `declared_wrote_code` | INTEGER | Boolean (1/0) self-report. |
 | `verified_outcome` | TEXT | Ground-truth outcome after verification. |
 | `pr_url` | TEXT | Final PR URL (may differ from declared). |
-| `failure_class` | TEXT | `transient-infra`, `runner-crash`, `no-pr`, `wrong-outcome`, `unexpected`, `breaker`, `logic`. |
+| `failure_class` | TEXT | `transient-infra`, `runner-crash`, `verify-failed`, `no-pr`, `wrong-outcome`, `unexpected`, `breaker`, `logic`. |
 | `failure_detail` | TEXT | Human-readable error. |
 | `summary` | TEXT | Runner summary (posted back). |
+| `verify_status` | TEXT | Verification gate result for the latest run: `passed` \| `failed` \| `skipped` (no command configured, or a remote run). |
+| `verify_detail` | TEXT | One line per verify command (`✓ \`pnpm typecheck\` (exit 0, 41s)`); on failure, the failing command's output tail follows. |
+| `output_tail` | TEXT | Last ~50 lines of the previous run's output, stored when a retry is scheduled — becomes the next attempt's `<previous_attempt>`. Cleared by `milo retry`. |
+| `criteria_passed` / `criteria_total` | INTEGER | The agent's acceptance-criteria tally from `MILO_RESULT.criteria`, when reported. |
 | `remote_provider` | TEXT | `conductor` when the work ran off-machine, else null. |
 | `remote_workspace_id` / `remote_session_id` | TEXT | The remote workspace + session. Present so a daemon restart **reattaches** instead of dispatching a duplicate cloud workspace. |
 | `remote_url` | TEXT | Deep link to the remote workspace — the "where is my work" answer. |
@@ -170,7 +174,7 @@ blockers finish, merge, fail, or vanish.
 
 ## `schema_meta` — versioning
 
-`key TEXT PK, value TEXT` — holds the schema version (currently **5**).
+`key TEXT PK, value TEXT` — holds the schema version (currently **6**).
 
 Migrations are **idempotent and additive**: every column is declared in `SCHEMA` (so a fresh DB gets it)
 *and* added via a `PRAGMA table_info(jobs)`-guarded `ALTER TABLE` (so an existing DB catches up). There
@@ -181,6 +185,7 @@ is no down-migration.
 | 3 | `events_log`, `runner_log` |
 | 4 | `cancel_requested`, `cancel_requested_at`, terminal state `cancelled` |
 | 5 | `remote_provider`, `remote_workspace_id`, `remote_session_id`, `remote_url`, `remote_cursor`, `remote_saw_working` (Conductor Cloud) |
+| 6 | `verify_status`, `verify_detail`, `output_tail`, `criteria_passed`, `criteria_total` (verification gate + retry context) |
 
 ---
 

@@ -27,6 +27,11 @@ The router (`packages/core/src/router.ts`) picks the runner in this order (first
 > Only `chain[0]` is used today. Falling back along the chain on overload/crash is a planned follow-up
 > (REMAINING-WORK B3).
 
+A repo's `.milo/config.json` can override the model per label: `--model` resolves as `[agent=…]` tag /
+`runner:` label (picks the **runner**) → `model.byLabel[<first matching issue label>]` →
+`model.default` → `runnerDefaults.<runner>.modelChain[0]`. See
+[configuration.md](./configuration.md#per-repo-config-repomiloconfigjson).
+
 ---
 
 ## ClaudeRunner (`runClaude`)
@@ -35,19 +40,23 @@ Invokes Claude Code headlessly:
 
 ```
 claude -p --dangerously-skip-permissions --model <model> \
-       [--append-system-prompt <augment>] --verbose <prompt>
+       [--append-system-prompt <augment>] [--max-turns <n>] --verbose <prompt>
 ```
 
 | Flag | Why |
 |------|-----|
 | `-p` | Headless: prompt comes from the arg, not stdin (stdin is ignored to avoid a `claude -p` stall). |
 | `--dangerously-skip-permissions` | No interactive permission prompts (it's automation). |
-| `--model` | The selected model. |
+| `--model` | The selected model (global chain, or the repo's `model.byLabel` / `model.default`). |
 | `--append-system-prompt` | The combined global + per-repo prompt augmentation. |
+| `--max-turns` | Only when the repo's `.milo/config.json` sets `maxTurns`. |
 
 **Environment:** strips `ANTHROPIC_API_KEY` and Claude-Code-specific vars to force OAuth/subscription
-auth, and ensures `/opt/homebrew/bin`, `/usr/local/bin`, and `~/.local/bin` are on PATH. stdout+stderr
-are captured to the run's log file (and optionally mirrored to an `echo` stream).
+auth, and ensures `/opt/homebrew/bin`, `/usr/local/bin`, and `~/.local/bin` are on PATH. **Everything
+else is inherited** — notably `GH_TOKEN`, so `gh` inside the run (and in the verification gate, which
+uses the daemon's own env) acts as whatever identity the daemon was started with; the launchd start
+script sources `$MILO_HOME/env` for this. stdout+stderr are captured to the run's log file (and
+optionally mirrored to an `echo` stream).
 
 ---
 
@@ -123,21 +132,28 @@ MILO_RESULT={"outcome":"implemented","wroteCode":true,"prUrl":"https://github.co
 
 ## The prompt
 
-`buildPrompt` (create) and `buildAttachPrompt` (attach) assemble the runner input
-(`packages/core/src/prompt.ts`). The create prompt wraps repo context, the Linear issue (title,
-description, labels, priority, comments), and the routing instruction in tagged sections, then gives a
+`buildPrompt` (create) and `buildAttachPrompt` / `buildLinearAttachPrompt` (attach) assemble the
+runner input (`packages/core/src/prompt.ts`). Every prompt is **header + body + footer**: the header
+(`<context>`, the issue/PR blocks, `<routing>` / `<requested_change>`, `<previous_attempt>` on a
+retry) and the footer (the `MILO_RESULT` contract) always come from code; the body is the repo's
+`.milo/workflows/*.md` when it has one, else the built-in text below. The create prompt wraps repo
+context, the Linear issue (title, description, labels, priority, parent, attachments, sub-issues, the
+**newest** 20 comments oldest→newest), and the routing instruction in tagged sections, then gives a
 **6-phase workflow**:
 
-1. **Understand & plan** — read the ticket, `CLAUDE.md`, relevant code.
+1. **Understand & plan** — read the ticket, `CLAUDE.md` / `AGENTS.md`, relevant code.
 2. **Implement** — make the change.
 3. **Verify** — run the project's verify script (or typecheck/build/test/lint).
 4. **Fix & re-verify** — up to 3 attempts.
 5. **Commit & push** — stage explicitly, commit `Implements <ID>`, `git push -u origin HEAD`.
-6. **Create PR** — if none exists, open one whose body includes `Closes <ID>`.
+6. **Create PR** — if none exists, open one whose body includes `Closes <ID>` (and the repo's labels).
 
 Hard rules in the prompt: no code → don't invent, set `outcome: discovery`; any code → you **must**
 commit, push, **and** open the PR; unrecoverable blocker → `outcome: blocked`. The attach prompt is
-similar but omits step 6 (the PR already exists) and uses the `@milo` instruction in place of routing.
+similar but omits step 6 (the PR already exists), uses the `@milo` instruction in place of routing, and
+carries `<pr_diff>` (stat + first 200 lines), `<review_threads>` (unresolved, first comment each),
+`<latest_reviews>` and `<failing_checks>`, fetched by Milo. `milo prompt --issue <ID>` prints any of
+these assembled, without running.
 
 ---
 

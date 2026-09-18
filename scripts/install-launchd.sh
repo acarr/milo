@@ -23,6 +23,10 @@ eval "\$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true
 export PATH="/usr/local/bin:\$HOME/.local/bin:\$PATH"
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+# Optional daemon environment (e.g. GH_TOKEN so \`gh\` inside runs + the verification gate acts as a
+# specific GitHub identity). KEY=value lines; sourced with allexport so every line is exported.
+MILO_ENV_FILE="\${MILO_HOME:-\$HOME/.milo}/env"
+if [ -f "\$MILO_ENV_FILE" ]; then set -a; . "\$MILO_ENV_FILE"; set +a; fi
 cd "$REPO"
 exec node_modules/.bin/tsx packages/daemon/src/index.ts
 EOF

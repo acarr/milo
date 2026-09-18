@@ -97,6 +97,28 @@ table, so it works across processes even though the live `Scheduler` only exists
 
 ---
 
+## `milo prompt`
+
+Two forms:
+
+- **`milo prompt <name>`** — run a scheduled prompt now (from `<repo>/.milo/schedules.json`; see
+  [scheduling.md](./scheduling.md)).
+- **`milo prompt --issue <ID> [--repo <name>] [--attempt-of <jobId>] [--attach] [--issue-file <json>]`** —
+  a **dry run**: print exactly the prompt a job for that issue would send, fully assembled (the repo's
+  `.milo/config.json` workflow with placeholders filled, labels, `<previous_attempt>` from a prior job,
+  attachments/parent/sub-issues). Nothing is enqueued and no runner starts. The prompt goes to stdout;
+  one metadata line (repo, runner, model, labels, workflow source, `maxTurns`, verify command) goes to
+  stderr, so `milo prompt --issue WAZ-1 > prompt.txt` captures just the prompt.
+  - `--repo` picks the repo by config name (else resolved from the team key + labels).
+  - `--attempt-of <jobId>` renders the retry prompt with that job's `failure_detail` / `output_tail`.
+  - `--attach` renders the Linear-revision (attach) prompt against the job's PR (or a placeholder URL).
+  - `--issue-file <path>` reads the issue from a JSON file (any subset of a `LinearIssue`) instead of
+    Linear — for fixtures and machines without Linear credentials.
+  - The repo config is read **strictly** here: a malformed `.milo/config.json` or a missing workflow file
+    is reported as an error (the daemon would fall back to the built-in text and log a warning).
+
+---
+
 ## `milo jobs [--json]`
 
 Lists up to the 100 most recent jobs from the SQLite store: entity, state, runner, age, and PR URL or

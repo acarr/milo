@@ -35,8 +35,8 @@ and `recoverOnStartup` requeues anything stranded by a crash. The model lives in
 | `claimed` | A worker has the lease; about to start. |
 | `setting-up` | Worktree creation, issue/PR fetch, runner selection. |
 | `running` | The runner (Claude/Codex) is executing, with a 30s heartbeat. |
-| `verifying` | Ground-truth git/`gh` check against the runner's self-report. |
-| `remediating` | Code exists but no PR (create mode) or unpushed (attach mode) — Milo fixes it. |
+| `verifying` | Ground-truth git/`gh` check against the runner's self-report, then the repo's `verifyCommand` (if configured). |
+| `remediating` | Code exists but no PR (create mode) or unpushed (attach mode) — Milo fixes it. Also the gate's one verify-failure retry run. |
 | `reporting` | Posting the Linear comment / agent-session response or GitHub comment. |
 | `done` | Implemented + PR exists/updated. Worktree torn down. |
 | `discovery-done` | Genuine investigation, no code written — correctly no PR. |
@@ -74,8 +74,13 @@ attempt 0 → 30s,  attempt 1 → 2m,  attempt 2+ → 8m
 
 `max_attempts` defaults to **3**. When attempts are exhausted, the job goes to **`needs-attention`**
 (not `failed`) and — if the repo's `teardownPolicy` is `keep-on-failure` — the worktree is preserved
-for debugging. Failures are classified (`failure_class`): `transient-infra`, `runner-crash`, `no-pr`,
-`wrong-outcome`, `unexpected`, `breaker`, `logic`.
+for debugging. Failures are classified (`failure_class`): `transient-infra`, `runner-crash`,
+`verify-failed`, `no-pr`, `wrong-outcome`, `unexpected`, `breaker`, `logic`.
+
+**Retries carry context.** When a retry is scheduled, the failing attempt's `failure_detail` and the
+last ~50 lines of its output (`output_tail`) are kept on the job, and the next attempt's prompt gets a
+`<previous_attempt>` block with both — so attempt 2 doesn't re-run the identical prompt blind. A
+manual `milo retry` clears that context (it's a fresh start by request).
 
 Only genuinely *flaky* failures retry. A **deterministic** worktree-setup failure (one retrying can
 never fix, e.g. the branch already checked out in another worktree, or the worktree path occupied by a
@@ -110,13 +115,41 @@ is a planned hardening — see `docs/REMAINING-WORK.md` B4.)
 1. **setting-up** — fetch the Linear issue; resolve repo (team key + labels); check the circuit
    breaker; resolve runner + model; create the worktree (`git worktree add -b <branch> origin/<base>`)
    and run setup; persist `worktree_path`, `branch`, `runner`, `model`.
-2. **running** — set the issue to *In Progress* (best-effort); build the prompt (repo context + issue +
-   routing + global/per-repo augmentation); run the runner under a heartbeat; parse `MILO_RESULT`.
-3. **verifying** — resolve **ground truth** from git/`gh`; store the declared vs verified outcome.
-4. **remediating** (if code changed but no PR) — `ensurePr`: commit/push/`gh pr create`.
-5. **reporting** — post the agent-session `response`/comment and a `found_pr`/`opened_pr` action; set
-   the issue to *In Review*; record an idempotent side-effect; tear the worktree down.
+2. **running** — set the issue to *In Progress* (best-effort); read the repo's `.milo/config.json`
+   (workflow body, labels, model-by-label, `maxTurns`); build the prompt (repo context + issue incl.
+   attachments/parent/sub-issues + routing + `<previous_attempt>` on a retry + the workflow or built-in
+   body); run the runner under a heartbeat; parse `MILO_RESULT` (incl. optional `criteria`).
+3. **verifying** — resolve **ground truth** from git/`gh`; store the declared vs verified outcome; then
+   run **the verify step** below when code changed and the run finished.
+4. **remediating** (if code changed but no PR) — `ensurePr`: commit/push/`gh pr create --label …`, with
+   the body's `## Verification` + `## Acceptance criteria` sections.
+5. **reporting** — post the agent-session `response`/comment (with the verification lines + criteria
+   tally) and a `found_pr`/`opened_pr` action; set the issue to *In Review*; record an idempotent
+   side-effect; tear the worktree down.
    - No code + `discovery` outcome + exit 0 → **discovery-done** (no PR, by design).
+
+### The verify step
+
+Applies to every local mode (create, Linear revision, GitHub attach, scheduled prompt) whenever the
+repo configures `verifyCommand` / a matching `verifyByPath` entry
+([configuration.md](./configuration.md#the-verification-gate)):
+
+```
+code changed & run finished
+  └─► run verify command(s) in the worktree            (verifying)
+        ├─ pass ──────────────────────────────────────► ensurePr / ensurePushed → done
+        └─ fail ─► ONE attach-mode retry run            (remediating)
+                   prompt = attach workflow + <previous_attempt>{failing output tail}
+                   └─► re-run verify                    (verifying)
+                         ├─ pass ─────────────────────► done  (verify_detail notes "after one retry")
+                         └─ fail ─► incomplete: draft [incomplete] PR / warning comment,
+                                    needs-attention, failure_class = verify-failed
+```
+
+Commands run through `/bin/sh -c` asynchronously (the job keeps heartbeating), each under
+`verifyTimeoutMs` (default 20 min; a timeout is a failure), stopping at the first failure. A remote
+(Conductor) run skips the step (`verify_status = skipped`) — its local worktree has no toolchain. A
+run that already died is not verified; its existing incomplete path wins.
 
 ### Attach mode (GitHub)
 
@@ -125,9 +158,12 @@ is a planned hardening — see `docs/REMAINING-WORK.md` B4.)
    If that branch is checked out in another worktree (e.g. the developer's tree), attach **detached** at
    the PR head instead — follow-up commits are pushed by refspec (`HEAD:<branch>`), so the developer's
    checkout is never touched.
-2. **running** — extract the instruction from the latest `@milo` comment; build the attach prompt; run
-   the runner under a heartbeat.
-3. **verifying** — ground truth.
+2. **running** — extract the instruction from the latest `@milo` comment; fetch the PR's `gh pr diff
+   --stat` + the first 200 diff lines, unresolved review threads, latest review states and failing
+   checks (Milo fetches these, not the model) and inject them as `<pr_diff>`, `<review_threads>`,
+   `<latest_reviews>`, `<failing_checks>`; build the attach prompt (repo `workflows.attach` or
+   built-in); run the runner under a heartbeat.
+3. **verifying** — ground truth, then the verify step above.
 4. **remediating** (if code changed) — `ensurePushed`: commit + push to the **existing** branch
    (no new PR).
 5. **reporting** — comment on the PR; tear the worktree down.
