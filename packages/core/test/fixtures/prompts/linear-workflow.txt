@@ -1,0 +1,51 @@
+<context>
+  <repository>wazzon</repository>
+  <working_directory>/wt/WAZ-1234</working_directory>
+  <base_branch>main</base_branch>
+  <branch>feature/waz-1234-add-thing</branch>
+  <package_manager>pnpm</package_manager>
+</context>
+
+<linear_issue>
+  <identifier>WAZ-1234</identifier>
+  <title>Add the thing</title>
+  <priority>High</priority>
+  <url>https://linear.app/wazzon/issue/WAZ-1234</url>
+  <labels>milo, class:chore</labels>
+  <description>
+As a user I want the thing.
+
+## Acceptance criteria
+- it exists
+- it works
+  </description>
+  <comments>
+[Alex — 2026-09-01T10:00:00Z]:
+Please keep it small.
+
+[Ripley — 2026-09-02T10:00:00Z]:
+@milo go
+  </comments>
+</linear_issue>
+
+<routing>
+iOS only.
+</routing>
+
+You are working on WAZ-1234 in wazzon (/wt/WAZ-1234), branch feature/waz-1234-add-thing off main.
+
+### Phase 1: Acceptance criteria
+Extract them into a numbered checklist.
+
+### Phase 7: PR
+Open the PR with `gh pr create --label agent-authored,class:chore` and `Closes WAZ-1234`. Leave {{NOT_A_MILO_VAR}} alone.
+
+## Final output (REQUIRED)
+As the very last line of your response, print one line of machine-readable JSON, prefixed exactly
+with `MILO_RESULT=` and nothing after it, e.g.:
+
+MILO_RESULT={"outcome":"implemented","wroteCode":true,"prUrl":"https://github.com/OWNER/wazzon/pull/123","summary":"Added X and Y; verify passed."}
+
+Where outcome is one of "implemented" | "discovery" | "blocked", wroteCode is a boolean, prUrl is the
+PR URL (or null), and summary is one or two sentences. If you tracked acceptance criteria, also include
+`"criteria":{"passed":<n>,"total":<m>}`.

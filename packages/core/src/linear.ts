@@ -14,7 +14,14 @@ export interface LinearIssue {
   url: string;
   state: { id: string; name: string; type: string };
   labels: string[];
+  /** Oldest → newest. Fetched with `last: 20`, so a long discussion keeps its NEWEST comments. */
   comments: { author: string; createdAt: string; body: string }[];
+  /** Files/links attached to the issue (Figma, screenshots, PRs, …). Absent on lightweight fetches. */
+  attachments?: { title: string; url: string }[];
+  /** The parent issue, when this is a sub-issue. */
+  parent?: { identifier: string; title: string };
+  /** Sub-issues with their workflow-state name. */
+  children?: { identifier: string; title: string; state?: string }[];
 }
 
 export interface WorkflowState {
@@ -85,6 +92,46 @@ export function isRecoverableAgentSession(
     s.appUser?.id === appUserId &&
     !!s.issue?.identifier
   );
+}
+
+/**
+ * Shape a raw Linear `Issue` node into a {@link LinearIssue}. Pure + exported so the mapping (and
+ * the comment ordering it guarantees) is unit-testable without a Linear token.
+ *
+ * Comments are fetched with `last: 20` so a busy ticket keeps its most recent discussion — the old
+ * `first: 20` silently dropped whatever was said after the twentieth comment, which is exactly the
+ * part that tends to hold the latest decision. Whatever order the API returns them in, they are
+ * sorted oldest → newest here so the prompt reads chronologically.
+ */
+export function normalizeIssueNode(issue: any): LinearIssue {
+  const comments = ((issue.comments?.nodes ?? []) as any[])
+    .map((n) => ({
+      author: (n.user?.name as string | undefined) ?? "unknown",
+      createdAt: n.createdAt as string,
+      body: n.body as string,
+    }))
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+  const out: LinearIssue = {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    description: issue.description ?? "",
+    priorityLabel: issue.priorityLabel ?? "None",
+    url: issue.url,
+    state: issue.state,
+    labels: (issue.labels?.nodes ?? []).map((n: any) => n.name),
+    comments,
+  };
+  const attachments = ((issue.attachments?.nodes ?? []) as any[])
+    .filter((a) => a?.url)
+    .map((a) => ({ title: (a.title as string | undefined) ?? "", url: a.url as string }));
+  if (attachments.length) out.attachments = attachments;
+  if (issue.parent?.identifier) out.parent = { identifier: issue.parent.identifier, title: issue.parent.title ?? "" };
+  const children = ((issue.children?.nodes ?? []) as any[])
+    .filter((c) => c?.identifier)
+    .map((c) => ({ identifier: c.identifier as string, title: (c.title as string | undefined) ?? "", state: c.state?.name as string | undefined }));
+  if (children.length) out.children = children;
+  return out;
 }
 
 export class LinearClient {
@@ -164,28 +211,17 @@ export class LinearClient {
           id identifier title description priority priorityLabel url
           state { id name type }
           labels { nodes { name } }
-          comments(first: 20) { nodes { body createdAt user { name } } }
+          comments(last: 20) { nodes { body createdAt user { name } } }
+          attachments(first: 20) { nodes { title url } }
+          parent { identifier title }
+          children(first: 50) { nodes { identifier title state { name } } }
         }
       }`,
       { id: identifier },
     );
     const issue = data.issue;
     if (!issue) throw new Error(`Issue ${identifier} not found in Linear`);
-    return {
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      description: issue.description ?? "",
-      priorityLabel: issue.priorityLabel ?? "None",
-      url: issue.url,
-      state: issue.state,
-      labels: (issue.labels?.nodes ?? []).map((n: any) => n.name),
-      comments: (issue.comments?.nodes ?? []).map((n: any) => ({
-        author: n.user?.name ?? "unknown",
-        createdAt: n.createdAt,
-        body: n.body,
-      })),
-    };
+    return normalizeIssueNode(issue);
   }
 
   /**
@@ -228,21 +264,7 @@ export class LinearClient {
   }
 
   private mapIssueNode(issue: any): LinearIssue {
-    return {
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      description: issue.description ?? "",
-      priorityLabel: issue.priorityLabel ?? "None",
-      url: issue.url,
-      state: issue.state,
-      labels: (issue.labels?.nodes ?? []).map((n: any) => n.name),
-      comments: (issue.comments?.nodes ?? []).map((n: any) => ({
-        author: n.user?.name ?? "unknown",
-        createdAt: n.createdAt,
-        body: n.body,
-      })),
-    };
+    return normalizeIssueNode(issue);
   }
 
   /**
@@ -267,7 +289,7 @@ export class LinearClient {
             id identifier title description priority priorityLabel url
             state { id name type }
             labels { nodes { name } }
-            comments(first: 20) { nodes { body createdAt user { name } } }
+            comments(last: 20) { nodes { body createdAt user { name } } }
           }
         }
       }`,

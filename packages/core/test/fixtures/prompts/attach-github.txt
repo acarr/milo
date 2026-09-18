@@ -1,0 +1,93 @@
+<context>
+  <repository>wazzon</repository>
+  <working_directory>/wt/WAZ-1234</working_directory>
+  <base_branch>main</base_branch>
+  <branch>feature/thing</branch>
+  <package_manager>pnpm</package_manager>
+</context>
+
+<pull_request>
+  <number>77</number>
+  <title>feat: the thing</title>
+  <url>https://github.com/octave-partners/wazzon/pull/77</url>
+  <body>
+## Summary
+Adds the thing.
+  </body>
+</pull_request>
+
+<pr_diff>
+  <stat>
+ packages/api/src/a.ts | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+  </stat>
+  <head truncated="true">
+diff --git a/packages/api/src/a.ts b/packages/api/src/a.ts
+--- a/packages/api/src/a.ts
++++ b/packages/api/src/a.ts
+@@ -1,2 +1,2 @@
+-const a = 1;
++const a = 2;
+  </head>
+  (The diff continues — run `gh pr diff` in the working directory for the rest.)
+</pr_diff>
+
+<review_threads>
+Unresolved review threads — each one needs a fix or a reply:
+- packages/api/src/a.ts:2 (alex): Why 2? This should stay 1 — see the test.
+- packages/api/src/b.ts (ripley): Missing null check.
+</review_threads>
+
+<latest_reviews>
+- alex: CHANGES_REQUESTED
+- ripley: COMMENTED
+</latest_reviews>
+
+<failing_checks>
+- CI: Server
+- Lint
+</failing_checks>
+
+<requested_change>
+Address the review.
+</requested_change>
+
+You are iterating on an EXISTING pull request. Its branch is already checked out in the working
+directory above, and the PR is already open on GitHub. The CLAUDE.md in this repository (and AGENTS.md,
+if present) contains all project conventions — follow them strictly.
+
+## Your Workflow — execute IN ORDER, run fully autonomously, do not stop between phases unless blocked.
+
+### Phase 1: Understand
+1. Read the requested change above, the PR description, and any review threads / failing checks
+   listed above.
+2. Read CLAUDE.md (and AGENTS.md, if present) and the code relevant to the request.
+
+### Phase 2: Implement
+Make the requested change, following CLAUDE.md conventions.
+
+### Phase 3: Verify (MANDATORY)
+Run the project's verification (`verify` script, else typecheck/build/test/lint as available). Fix and
+re-run with the smallest change; up to 3 attempts.
+
+### Phase 4: Commit and Push (update the existing PR — do NOT open a new one)
+1. Stage changed files explicitly (no `git add -A`/`git add .`).
+2. Commit with a conventional message.
+3. Push to the SAME branch: `git push origin HEAD`. This updates PR #77 automatically.
+4. Do NOT run `gh pr create` — the PR already exists.
+
+## Critical Rules
+1. Stay within the working directory / branch above. Never open a second PR for this work.
+2. Do NOT ask questions or wait for input — run fully autonomously.
+3. If there is genuinely nothing to change, set outcome=discovery and explain in the summary.
+4. If you hit an unrecoverable blocker, set outcome=blocked and explain.
+
+## Final output (REQUIRED)
+As the very last line of your response, print one line of machine-readable JSON, prefixed exactly
+with `MILO_RESULT=` and nothing after it, e.g.:
+
+MILO_RESULT={"outcome":"implemented","wroteCode":true,"prUrl":"https://github.com/octave-partners/wazzon/pull/77","summary":"Addressed the review feedback; verify passed."}
+
+Where outcome is one of "implemented" | "discovery" | "blocked", wroteCode is a boolean, prUrl is the
+PR URL, and summary is one or two sentences. If you tracked acceptance criteria, also include
+`"criteria":{"passed":<n>,"total":<m>}`.
