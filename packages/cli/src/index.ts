@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import { configPath } from "@milo/core";
 import { runDoctor, printDoctor } from "./doctor.js";
-import { runIssues, runPrompt, listJobs, showJob, watchJob, rerunJob, retryJob, cancelJob, listRepos, removeRepo, status, tailLog, pollNow, listSchedules, restartDaemon, stopDaemon } from "./run.js";
+import { runIssues, runPrompt, printPrompt, listJobs, showJob, watchJob, rerunJob, retryJob, cancelJob, listRepos, removeRepo, status, tailLog, pollNow, listSchedules, restartDaemon, stopDaemon } from "./run.js";
 import type { JobsFilter, StateFilter } from "./viewmodel.js";
 import { linearAuth } from "./linear-auth.js";
 
@@ -31,6 +31,8 @@ Usage:
   milo poll               poll Linear + GitHub once and enqueue any new work
   milo schedules [--json] list scheduled automations (next/last run)
   milo prompt <name>      run a scheduled prompt now (from <repo>/.milo/schedules.json)
+  milo prompt --issue <ID> [--repo <name>] [--attempt-of <jobId>] [--attach] [--issue-file <json>]
+                          dry run: print the fully assembled prompt for a Linear issue (no run)
   milo doctor [--json]    check the environment is ready
   milo linear-auth        register Milo as a Linear agent (OAuth actor=app)
   milo --help             show this help
@@ -171,9 +173,19 @@ async function main(argv: string[]): Promise<number> {
     case "schedules":
       return listSchedules(json);
     case "prompt": {
+      const issue = flagValue(args, "--issue");
+      if (issue) {
+        return printPrompt({
+          issue,
+          repo: flagValue(args, "--repo"),
+          attemptOf: flagValue(args, "--attempt-of"),
+          issueFile: flagValue(args, "--issue-file"),
+          attach: args.includes("--attach"),
+        });
+      }
       const name = args[1];
-      if (!name) {
-        console.error("usage: milo prompt <schedule-name>");
+      if (!name || name.startsWith("--")) {
+        console.error("usage: milo prompt <schedule-name>   |   milo prompt --issue <ID> [--repo <name>] [--attempt-of <jobId>] [--attach] [--issue-file <json>]");
         return 1;
       }
       return runPrompt(name);

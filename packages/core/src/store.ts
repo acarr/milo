@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS jobs (
   remote_cursor       TEXT,
   remote_saw_working  INTEGER,
   remote_polled_at    INTEGER,
+  -- v6: verification gate + retry context. output_tail is the last lines of the previous run's
+  -- output so a retry's prompt can carry it; verify_* record what the gate ran; criteria_*
+  -- keep the agent's acceptance-criteria tally.
+  verify_status       TEXT,
+  verify_detail       TEXT,
+  output_tail         TEXT,
+  criteria_passed     INTEGER,
+  criteria_total      INTEGER,
   created_at          INTEGER NOT NULL,
   updated_at          INTEGER NOT NULL,
   terminal_at         INTEGER
@@ -165,10 +173,16 @@ export function openDatabase(path = dbPath()): DB {
   // Liveness for a PARKED remote job: it holds no worker lease for hours at a time, so the
   // ordinary lease watchdog cannot see it. This is what `reclaimStalledRemote` keys on.
   if (!jobCols.has("remote_polled_at")) db.exec("ALTER TABLE jobs ADD COLUMN remote_polled_at INTEGER");
+  // v6: verification gate results + the previous attempt's output tail (retry context) + criteria.
+  if (!jobCols.has("verify_status")) db.exec("ALTER TABLE jobs ADD COLUMN verify_status TEXT");
+  if (!jobCols.has("verify_detail")) db.exec("ALTER TABLE jobs ADD COLUMN verify_detail TEXT");
+  if (!jobCols.has("output_tail")) db.exec("ALTER TABLE jobs ADD COLUMN output_tail TEXT");
+  if (!jobCols.has("criteria_passed")) db.exec("ALTER TABLE jobs ADD COLUMN criteria_passed INTEGER");
+  if (!jobCols.has("criteria_total")) db.exec("ALTER TABLE jobs ADD COLUMN criteria_total INTEGER");
   // Created here (not in SCHEMA) so the next_eligible_at column exists first on migrated databases.
   db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_eligible ON jobs(state, next_eligible_at)");
   db.prepare(
-    "INSERT INTO schema_meta(key, value) VALUES('schema_version', '5') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    "INSERT INTO schema_meta(key, value) VALUES('schema_version', '6') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
   ).run();
   return db;
 }

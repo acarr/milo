@@ -169,3 +169,41 @@ console.log("https://github.com/acme/repo/pull/999");
   assert.equal(res.remediated, false);
   assert.ok(!existsSync(argvFile), "must not run `gh pr create` when a PR already exists");
 });
+
+test("labels from the repo config + the ticket's class label reach `gh pr create --label`", async () => {
+  const wt = worktree();
+  writeFileSync(
+    join(ghDir, "gh"),
+    `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+if (argv[0] === "pr" && argv[1] === "list") { console.log("[]"); process.exit(0); }
+fs.writeFileSync(process.env.MILO_TEST_GH_ARGV, JSON.stringify(argv));
+console.log("https://github.com/acme/repo/pull/8");
+`,
+    { mode: 0o755 },
+  );
+  const { argv, body } = await capture({
+    worktreePath: wt,
+    baseBranch: "main",
+    branch: "feature/x",
+    ref: "WAZ-42",
+    title: "Chore: bump things",
+    summary: "Bumped.",
+    closes: "WAZ-42",
+    labels: ["agent-authored", "class:chore"],
+    criteria: { passed: 2, total: 2 },
+    verification: [{ command: "pnpm typecheck", passed: true, exitCode: 0, outputTail: "", durationMs: 5_000 }],
+  });
+  const i = argv.indexOf("--label");
+  assert.ok(i > 0, "gh pr create must receive --label");
+  assert.equal(argv[i + 1], "agent-authored,class:chore");
+  assert.match(body, /## Acceptance criteria\n\n2 of 2 passed/);
+  assert.match(body, /## Verification\n\n- `pnpm typecheck` — passed/);
+});
+
+test("no labels configured → no --label flag at all", async () => {
+  const wt = worktree();
+  const { argv } = await capture({ worktreePath: wt, baseBranch: "main", branch: "feature/x", ref: "T-1", title: "t", summary: "s", labels: [] });
+  assert.ok(!argv.includes("--label"));
+});

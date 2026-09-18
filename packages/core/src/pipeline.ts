@@ -12,10 +12,25 @@ import {
   buildAttachPrompt,
   buildLinearAttachPrompt,
   buildConductorPrompt,
+  routingInstruction,
+  verifyFailureInstruction,
+  type PreviousAttempt,
 } from "./prompt.js";
-import { resolveGroundTruth, ensurePr, ensurePushed } from "./verify.js";
+import {
+  resolveGroundTruth,
+  ensurePr,
+  ensurePushed,
+  changedFiles,
+  runVerification,
+  describeVerification,
+  markPrIncomplete,
+  outputTail,
+  type VerifyOutcome,
+  type AcceptanceCriteria,
+} from "./verify.js";
+import { getRepoConfig, prLabelsFor, modelOverrideFor, verifyCommandsFor, type ResolvedRepoConfig } from "./repo-config.js";
 import { resolveRunner, modelFor, resolveRepoByGithub, isRemoteRunner, type RunnerId } from "./router.js";
-import { fetchPr, prComments, addPrComment, githubSlugForPath, type PullRequest } from "./github.js";
+import { fetchPr, prComments, addPrComment, githubSlugForPath, fetchPrContext, parsePrUrl, type PullRequest, type PrContext } from "./github.js";
 import { worktreeBase } from "./paths.js";
 import { logsDir } from "./paths.js";
 import { logger } from "./logger.js";
@@ -75,6 +90,8 @@ export interface RunnerFn {
     signal?: AbortSignal;
     /** Optional — existing runners and their tests are unaffected. */
     context?: RunnerContext;
+    /** Cap on agentic turns, from the repo's `.milo/config.json` (`maxTurns`). */
+    maxTurns?: number;
   }): Promise<{
     code: number;
     output: string;
@@ -92,6 +109,8 @@ export interface RunnerResultLike {
   wroteCode: boolean;
   prUrl: string | null;
   summary: string;
+  /** Optional `criteria: {passed, total}` the workflow may ask the agent to report. */
+  criteria?: AcceptanceCriteria;
   /** Set when the `MILO_RESULT=` line existed but needed repair (or was unrecoverable). */
   parseNote?: string;
 }
@@ -117,12 +136,31 @@ export interface PipelineDeps {
 
 const BACKOFF_MS = [30_000, 120_000, 480_000];
 
-function routingInstruction(repo: RepoConfig, issue: LinearIssue): string {
-  for (const label of issue.labels) {
-    const r = repo.routing?.[label.toLowerCase().trim()];
-    if (r) return r;
+/**
+ * What the previous attempt of this job left behind, for the retry prompt's `<previous_attempt>`.
+ * Only a job that has actually failed before (attempts > 0 with a recorded failure) gets one, so a
+ * first run's prompt is byte-identical to what it was before retries carried context.
+ */
+function previousAttemptFor(job: Job): PreviousAttempt | undefined {
+  const fresh = job;
+  if (fresh.attempts <= 0) return undefined;
+  if (!fresh.failureDetail && !fresh.outputTail) return undefined;
+  return {
+    attempt: fresh.attempts,
+    errorDetail: fresh.failureDetail ?? undefined,
+    outputTail: fresh.outputTail ?? undefined,
+  };
+}
+
+/** Best-effort PR context (diff / review threads / checks) for an attach prompt. */
+async function prContextFor(slug: string | undefined, number: number | undefined): Promise<PrContext | undefined> {
+  if (!slug || !number) return undefined;
+  try {
+    return await fetchPrContext(slug, number);
+  } catch (err) {
+    logger.warn({ slug, number, err: (err as Error).message }, "could not fetch PR context for the attach prompt");
+    return undefined;
   }
-  return repo.defaultRouting ?? "No specific routing.";
 }
 
 /**
@@ -246,10 +284,12 @@ export function makeProcessJob(deps: PipelineDeps) {
     }
   };
 
-  const fail = (job: Job, failureClass: string, detail: string, teardown?: () => void) => {
+  const fail = (job: Job, failureClass: string, detail: string, teardown?: () => void, tail?: string) => {
     const attempt = job.attempts; // attempts already reflects this run's count baseline
     if (attempt + 1 < job.maxAttempts) {
       const delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)]!;
+      // Keep the run's output tail so the next attempt's prompt can show what this one hit.
+      if (tail !== undefined) store.recordRunOutput(job.id, tail || null);
       store.scheduleRetry(job.id, delay, failureClass, detail);
       logger.warn({ jobId: job.id, failureClass, delay }, "scheduled retry");
       teardown?.(); // fresh worktree next attempt
@@ -395,6 +435,87 @@ export function makeProcessJob(deps: PipelineDeps) {
     logger.info({ jobId: job.id }, "job cancelled by user");
   }
 
+  /**
+   * The verification step of the gate. Runs the repo's configured verify command(s) in the
+   * worktree; on failure gives the agent ONE attach-mode retry whose prompt carries the failing
+   * output (`<previous_attempt>`), then re-verifies. Records the outcome on the job. Returns
+   * `passed`/`skipped` when the job may proceed to `done`, `failed` with the reason otherwise, or
+   * `cancelled` when the retry run was cancelled by the user.
+   *
+   * `retry` is the caller's way to run the agent again in the same worktree (it knows the runner,
+   * model, sinks, and which prompt builder fits its mode); when it is undefined (remote runs, whose
+   * local worktree has no toolchain installed) the step is skipped.
+   */
+  async function verifyGate(i: {
+    job: Job;
+    repoCfg: ResolvedRepoConfig;
+    worktree: Worktree;
+    thought?: (body: string) => void;
+    retry?: (previous: PreviousAttempt, instruction: string) => Promise<{ run: { output: string; errorDetail?: string }; cancelled: boolean }>;
+  }): Promise<
+    | { status: "passed" | "skipped"; outcomes: VerifyOutcome[] }
+    | { status: "failed"; outcomes: VerifyOutcome[]; reason: string }
+    | { status: "cancelled"; outcomes: VerifyOutcome[] }
+  > {
+    const { job, repoCfg, worktree, thought, retry } = i;
+    const timeoutMs = repoCfg.config.verifyTimeoutMs;
+    const planFor = async () => verifyCommandsFor(repoCfg.config, await changedFiles(worktree.path, worktree.baseBranch));
+    let plan = await planFor();
+    if (!plan.length || !retry) {
+      const why = !plan.length ? "no verifyCommand configured for the changed paths" : "remote runner (no local toolchain)";
+      store.transition(job.id, "verifying", { verify_status: "skipped", verify_detail: why });
+      return { status: "skipped", outcomes: [] };
+    }
+
+    thought?.(`Running the verification gate: ${plan.map((p) => `\`${p.command}\``).join(", ")}…`);
+    store.recordEvent(job.id, "verify", { phase: "initial", commands: plan.map((p) => p.command) });
+    let result = await runVerification(plan, worktree.path, { timeoutMs });
+    if (result.passed) {
+      store.transition(job.id, "verifying", { verify_status: "passed", verify_detail: describeVerification(result.outcomes) });
+      thought?.(`Verification passed.`);
+      return { status: "passed", outcomes: result.outcomes };
+    }
+
+    // One retry, with the failure in front of the agent.
+    const failed = result.outcomes.filter((o) => !o.passed);
+    const previous: PreviousAttempt = {
+      attempt: job.attempts + 1,
+      errorDetail: `Verification gate failed:\n${describeVerification(result.outcomes)}`,
+      outputTail: failed[failed.length - 1]?.outputTail,
+    };
+    store.transition(job.id, "remediating", { verify_status: "failed", verify_detail: describeVerification(result.outcomes) });
+    store.recordEvent(job.id, "verify", { phase: "failed", commands: failed.map((o) => o.command) });
+    thought?.(`Verification failed (${failed.map((o) => `\`${o.command}\``).join(", ")}) — giving the agent one retry with the failure output.`);
+    const attempt = await retry(previous, verifyFailureInstruction(failed));
+    if (attempt.cancelled) return { status: "cancelled", outcomes: result.outcomes };
+    if (attempt.run.errorDetail) logger.warn({ jobId: job.id, err: attempt.run.errorDetail }, "verify retry run did not finish cleanly");
+
+    store.transition(job.id, "verifying");
+    plan = await planFor();
+    store.recordEvent(job.id, "verify", { phase: "retry", commands: plan.map((p) => p.command) });
+    result = await runVerification(plan, worktree.path, { timeoutMs });
+    const detail = describeVerification(result.outcomes);
+    if (result.passed) {
+      store.transition(job.id, "verifying", { verify_status: "passed", verify_detail: `${detail}\n(after one retry)` });
+      thought?.(`Verification passed after the retry.`);
+      return { status: "passed", outcomes: result.outcomes };
+    }
+    const stillFailed = result.outcomes.filter((o) => !o.passed);
+    const tail = stillFailed[stillFailed.length - 1]?.outputTail ?? "";
+    const reason = `verification failed after one retry: ${stillFailed.map((o) => `\`${o.command}\` ${o.timedOut ? "timed out" : `exited ${o.exitCode ?? "?"}`}`).join("; ")}`;
+    store.transition(job.id, "verifying", { verify_status: "failed", verify_detail: `${detail}\n\n${tail}` });
+    thought?.(`Verification still failing after the retry — parking this for a human.`);
+    return { status: "failed", outcomes: result.outcomes, reason: tail ? `${reason}\n\n\`\`\`\n${outputTail(tail, 30)}\n\`\`\`` : reason };
+  }
+
+  /** The `## Verification` / criteria lines appended to a Linear report. */
+  function reportExtras(outcomes: VerifyOutcome[] | undefined, criteria: AcceptanceCriteria | undefined): string {
+    const lines: string[] = [];
+    if (outcomes?.length) lines.push(`**Verification gate:**\n${describeVerification(outcomes)}`);
+    if (criteria) lines.push(`**Acceptance criteria:** ${criteria.passed} of ${criteria.total} passed (agent self-review).`);
+    return lines.length ? `\n\n${lines.join("\n\n")}` : "";
+  }
+
   // ---------------------------------------------------------------- Linear (create mode)
 
   async function processLinearJob(job: Job): Promise<void> {
@@ -446,8 +567,13 @@ export function makeProcessJob(deps: PipelineDeps) {
       });
       return;
     }
-    const model = modelFor(config, runnerId, repo);
+    // Per-repo `.milo/config.json`: workflow bodies, labels, verify gate, model-by-label. Re-read
+    // on every job so edits in the repo land without a daemon restart.
+    const repoCfg = getRepoConfig(repo.path);
+    const model = (!isRemoteRunner(runnerId) && modelOverrideFor(repoCfg.config, issue.labels)) || modelFor(config, runnerId, repo);
     const remote = isRemoteRunner(runnerId);
+    const labels = prLabelsFor(repoCfg.config, issue.labels);
+    const previousAttempt = previousAttemptFor(job);
 
     // A remote run's whole contract is "push this branch to this GitHub repo", and the agent is
     // told the slug explicitly. Without one there is nothing to hand it — fail before spending a
@@ -519,8 +645,18 @@ export function makeProcessJob(deps: PipelineDeps) {
           branch: worktree.branch,
           baseBranch: worktree.baseBranch,
           githubRepo: repoSlug!, // guaranteed by the remote precondition check above
+          previousAttempt,
         })
-      : buildPrompt({ repo, worktree, issue, routingInstruction: routingInstruction(repo, issue) });
+      : buildPrompt({
+          repo,
+          worktree,
+          issue,
+          routingInstruction: routingInstruction(repo, issue),
+          workflow: repoCfg.workflows.linearIssue,
+          labels,
+          previousAttempt,
+        });
+    if (previousAttempt) thought(`Retrying (attempt ${previousAttempt.attempt + 1}) with the previous failure in the prompt.`);
     store.heartbeat(job.id);
 
     // Phase C: only stream live progress when the issue was delegated to the agent (has a session).
@@ -538,6 +674,7 @@ export function makeProcessJob(deps: PipelineDeps) {
         : undefined;
 
     const sinks = buildSinks(job.id, progress);
+    const maxTurns = repoCfg.config.maxTurns ?? undefined;
     const { run, cancelled } = await runWithCancel(
       job,
       {
@@ -548,6 +685,7 @@ export function makeProcessJob(deps: PipelineDeps) {
         logFile,
         echo,
         onEvent: sinks.onEvent,
+        maxTurns,
         context: {
           jobId: job.id,
           ref,
@@ -568,6 +706,40 @@ export function makeProcessJob(deps: PipelineDeps) {
     // Flush any buffered progress and stop before the terminal response so it always lands last.
     await progress?.stop();
 
+    // The gate's one verify-failure retry: the same runner, same worktree, an attach-style prompt
+    // that carries the failing output. Local runs only — a remote run's worktree has no toolchain.
+    const verifyRetry = remote
+      ? undefined
+      : async (previous: PreviousAttempt, instruction: string) => {
+          const retrySinks = buildSinks(job.id);
+          try {
+            return await runWithCancel(
+              job,
+              {
+                cwd: worktree!.path,
+                prompt: buildLinearAttachPrompt({
+                  repo: repo!,
+                  worktree: worktree!,
+                  issue,
+                  prUrl: (await resolveGroundTruth(worktree!.path, worktree!.baseBranch, worktree!.branch)).prUrl ?? "(not opened yet — Milo opens it once verification passes)",
+                  instruction,
+                  workflow: repoCfg.workflows.attach,
+                  previousAttempt: previous,
+                }),
+                model,
+                appendSystemPrompt: augment || undefined,
+                logFile,
+                echo,
+                onEvent: retrySinks.onEvent,
+                maxTurns,
+              },
+              runner,
+            );
+          } finally {
+            retrySinks.close();
+          }
+        };
+
     // Remote dispatch succeeded: the cloud session is live and its ids are persisted. Park the job
     // and RETURN — the queue's cap is in-process `inFlight` accounting, so returning here frees the
     // local slot while the (possibly hour-long) remote work continues. A tracker resumes it.
@@ -581,6 +753,7 @@ export function makeProcessJob(deps: PipelineDeps) {
     await finalizeCreateRun({
       job,
       repo,
+      repoCfg,
       worktree,
       issue,
       teamKey,
@@ -589,6 +762,8 @@ export function makeProcessJob(deps: PipelineDeps) {
       ref,
       run,
       cancelled,
+      labels,
+      verifyRetry,
     });
   }
 
@@ -600,16 +775,20 @@ export function makeProcessJob(deps: PipelineDeps) {
   async function finalizeCreateRun(i: {
     job: Job;
     repo: RepoConfig;
+    repoCfg: ResolvedRepoConfig;
     worktree: Worktree;
     issue: LinearIssue;
     teamKey: string;
     sessionId: string | undefined;
     thought: (body: string) => void;
     ref: string;
-    run: { code: number; output: string };
+    run: { code: number; output: string; errorDetail?: string };
     cancelled: boolean;
+    labels: string[];
+    /** Present for local runs; undefined for remote runs (no local toolchain → gate skipped). */
+    verifyRetry?: Parameters<typeof verifyGate>[0]["retry"];
   }): Promise<void> {
-    const { job, repo, worktree, issue, teamKey, sessionId, thought, ref, run, cancelled } = i;
+    const { job, repo, repoCfg, worktree, issue, teamKey, sessionId, thought, ref, run, cancelled, labels, verifyRetry } = i;
 
     if (cancelled) {
       await finalizeCancelled(job, repo, worktree.path, async () => {
@@ -626,12 +805,34 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_pr_url: result.prUrl,
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
+      criteria_passed: result.criteria?.passed ?? null,
+      criteria_total: result.criteria?.total ?? null,
     });
     const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
-    const incomplete = runIncomplete(run);
+    let incomplete = runIncomplete(run);
+    let failureClass = "runner-crash";
+    let verification: VerifyOutcome[] | undefined;
 
     if (gt.codeChanged) {
+      // Run the repo's verify command(s) before anything is shipped. A crashed run is already
+      // incomplete — verifying half-written code would only bury the real reason.
+      if (!incomplete) {
+        const v = await verifyGate({ job, repoCfg, worktree, thought, retry: verifyRetry });
+        if (v.status === "cancelled") {
+          await finalizeCancelled(job, repo, worktree.path, async () => {
+            if (sessionId) await linear.agentError(sessionId, "Milo cancelled this run.");
+          });
+          return;
+        }
+        verification = v.outcomes;
+        if (v.status === "failed") {
+          incomplete = { reason: v.reason };
+          failureClass = "verify-failed";
+        }
+      }
+
       let prUrl: string;
+      let remediated = false;
       try {
         if (!gt.prUrl) store.transition(job.id, "remediating");
         const ensured = await ensurePr({
@@ -643,15 +844,21 @@ export function makeProcessJob(deps: PipelineDeps) {
           summary: result.summary,
           closes: ref, // Linear ticket auto-closes on merge
           incomplete,
+          labels,
+          criteria: result.criteria,
+          verification,
         });
         prUrl = ensured.prUrl;
+        remediated = ensured.remediated;
         if (ensured.remediated) store.recordEvent(job.id, "remediation", { action: "milo-created-pr", prUrl });
         if (sessionId) await linear.agentAction(sessionId, ensured.remediated ? "opened_pr" : "found_pr", prUrl);
       } catch (err) {
         if (sessionId) await linear.agentError(sessionId, `Code was written but Milo couldn't open a PR: ${(err as Error).message}`);
-        fail(job, "no-pr", (err as Error).message);
+        fail(job, "no-pr", (err as Error).message, undefined, outputTail(run.output));
         return;
       }
+      // The agent opened the PR itself, so `ensurePr` couldn't draft it — do that now (best-effort).
+      if (incomplete && !remediated) await markPrIncomplete(worktree.path, prUrl, incomplete.reason);
 
       // A run that died mid-flight left code, so it still gets a PR (drafted, and captioned as
       // partial by `ensurePr`) — but it must NOT be recorded as a shipped implementation. WAZ-1150
@@ -674,7 +881,7 @@ export function makeProcessJob(deps: PipelineDeps) {
         store.transition(job.id, "needs-attention", {
           verified_outcome: "incomplete",
           pr_url: prUrl,
-          failure_class: "runner-crash",
+          failure_class: failureClass,
           failure_detail: incomplete.reason,
         });
         logger.warn({ jobId: job.id, ref, prUrl, reason: incomplete.reason }, "run did not finish — draft PR, needs attention");
@@ -682,7 +889,11 @@ export function makeProcessJob(deps: PipelineDeps) {
         return;
       }
 
-      await reportLinear(job, issue, teamKey, sessionId, { kind: "implemented", prUrl, summary: result.summary });
+      await reportLinear(job, issue, teamKey, sessionId, {
+        kind: "implemented",
+        prUrl,
+        summary: result.summary + reportExtras(verification, result.criteria),
+      });
       store.transition(job.id, "done", { verified_outcome: "implemented", pr_url: prUrl });
       store.recordRepoSuccess(repo.name);
       teardownIfNeeded(repo, worktree.path, true);
@@ -704,8 +915,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       else await linear.agentError(sessionId, `Milo couldn't complete this: ${detail}.`);
     }
     fail(job, incomplete ? "runner-crash" : "wrong-outcome", detail, () =>
-      teardownIfNeeded(repo, worktree.path, false, true),
-    );
+      teardownIfNeeded(repo, worktree.path, false, true), outputTail(run.output));
   }
 
   /**
@@ -789,7 +999,23 @@ export function makeProcessJob(deps: PipelineDeps) {
     sinks.close();
     await progress?.stop();
 
-    await finalizeCreateRun({ job, repo, worktree, issue, teamKey, sessionId, thought, ref, run, cancelled });
+    const repoCfg = getRepoConfig(repo.path);
+    await finalizeCreateRun({
+      job,
+      repo,
+      repoCfg,
+      worktree,
+      issue,
+      teamKey,
+      sessionId,
+      thought,
+      ref,
+      run,
+      cancelled,
+      labels: prLabelsFor(repoCfg.config, issue.labels),
+      // No local toolchain in a remote job's worktree (skipSetup) — the gate is skipped.
+      verifyRetry: undefined,
+    });
   }
 
   // ---------------------------------------------------------------- Linear (revise existing PR)
@@ -839,7 +1065,10 @@ export function makeProcessJob(deps: PipelineDeps) {
       store.transition(job.id, "needs-attention", { failure_class: "logic", failure_detail: `runner "${runnerId}" is not registered` });
       return;
     }
-    const model = modelFor(config, runnerId);
+    const repoCfg = getRepoConfig(repo.path);
+    const model = modelOverrideFor(repoCfg.config, issue.labels) ?? modelFor(config, runnerId);
+    const maxTurns = repoCfg.config.maxTurns ?? undefined;
+    const previousAttempt = previousAttemptFor(job);
 
     // Attach to the ticket's existing branch (a distinct worktree dir from create mode's). When the
     // branch is checked out elsewhere (e.g. the developer's tree), attachWorktree falls back to a
@@ -877,16 +1106,37 @@ export function makeProcessJob(deps: PipelineDeps) {
     const instruction = (promptBody && promptBody.trim()) || latestMentionInstruction(issue);
 
     const augment = [config.promptAugmentation.global, repo.promptAugmentation].filter(Boolean).join("\n\n");
-    const prompt = buildLinearAttachPrompt({ repo, worktree, issue, prUrl: prior.prUrl, instruction });
+    // The PR's diff, unresolved review threads, review verdicts and failing checks — fetched here,
+    // not by the model, so the revision starts from what reviewers actually said.
+    const priorPr = parsePrUrl(prior.prUrl);
+    const prContext = await prContextFor(priorPr?.repo ?? repo.githubRepo ?? githubSlugForPath(repo.path), priorPr?.number);
+    const attachPrompt = (instr: string, previous?: PreviousAttempt) =>
+      buildLinearAttachPrompt({
+        repo: repo!,
+        worktree: worktree!,
+        issue,
+        prUrl: prior.prUrl,
+        instruction: instr,
+        prContext,
+        workflow: repoCfg.workflows.attach,
+        previousAttempt: previous,
+      });
+    const prompt = attachPrompt(instruction, previousAttempt);
     store.heartbeat(job.id);
 
-    const sinks = buildSinks(job.id);
-    const { run, cancelled } = await runWithCancel(
-      job,
-      { cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent },
-      runner,
-    );
-    sinks.close();
+    const runAgent = async (p: string) => {
+      const sinks = buildSinks(job.id);
+      try {
+        return await runWithCancel(
+          job,
+          { cwd: worktree!.path, prompt: p, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent, maxTurns },
+          runner,
+        );
+      } finally {
+        sinks.close();
+      }
+    };
+    const { run, cancelled } = await runAgent(prompt);
     if (cancelled) {
       await finalizeCancelled(job, repo, worktree.path, async () => {
         if (sessionId) await linear.agentError(sessionId, "Milo cancelled this revision.");
@@ -901,18 +1151,43 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_pr_url: result.prUrl,
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
+      criteria_passed: result.criteria?.passed ?? null,
+      criteria_total: result.criteria?.total ?? null,
     });
     const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
-    const incomplete = runIncomplete(run);
+    let incomplete = runIncomplete(run);
+    let failureClass = "runner-crash";
+    let verification: VerifyOutcome[] | undefined;
 
     if (gt.codeChanged) {
+      if (!incomplete) {
+        const v = await verifyGate({
+          job,
+          repoCfg,
+          worktree,
+          thought,
+          retry: (previous, instr) => runAgent(attachPrompt(instr, previous)),
+        });
+        if (v.status === "cancelled") {
+          await finalizeCancelled(job, repo, worktree.path, async () => {
+            if (sessionId) await linear.agentError(sessionId, "Milo cancelled this revision.");
+          });
+          return;
+        }
+        verification = v.outcomes;
+        if (v.status === "failed") {
+          incomplete = { reason: v.reason };
+          failureClass = "verify-failed";
+        }
+      }
+
       // Push follow-up commits to the EXISTING branch — the open PR updates itself.
       if (!gt.pushed || gt.dirty) store.transition(job.id, "remediating");
       const message = incomplete ? `${ref}: follow-up (partial — run did not finish)` : `${ref}: follow-up`;
       const pushed = await ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
       if (!pushed.pushed) {
         if (sessionId) await linear.agentError(sessionId, `Milo made changes but couldn't push the follow-up to the PR branch.`);
-        fail(job, "no-pr", "failed to push follow-up commits to the PR branch");
+        fail(job, "no-pr", "failed to push follow-up commits to the PR branch", undefined, outputTail(run.output));
         return;
       }
       if (pushed.committed) store.recordEvent(job.id, "remediation", { action: "milo-pushed-followup" });
@@ -935,7 +1210,7 @@ export function makeProcessJob(deps: PipelineDeps) {
         store.transition(job.id, "needs-attention", {
           verified_outcome: "incomplete",
           pr_url: prior.prUrl,
-          failure_class: "runner-crash",
+          failure_class: failureClass,
           failure_detail: incomplete.reason,
         });
         logger.warn({ jobId: job.id, ref, prUrl: prior.prUrl, reason: incomplete.reason }, "revision did not finish — needs attention");
@@ -943,7 +1218,11 @@ export function makeProcessJob(deps: PipelineDeps) {
         return;
       }
 
-      await reportLinear(job, issue, teamKey, sessionId, { kind: "followup", prUrl: prior.prUrl, summary: result.summary });
+      await reportLinear(job, issue, teamKey, sessionId, {
+        kind: "followup",
+        prUrl: prior.prUrl,
+        summary: result.summary + reportExtras(verification, result.criteria),
+      });
       store.transition(job.id, "done", { verified_outcome: "implemented", pr_url: prior.prUrl });
       store.recordRepoSuccess(repo.name);
       teardownIfNeeded(repo, worktree.path, true);
@@ -966,8 +1245,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       else await linear.agentError(sessionId, `Milo couldn't complete this revision: ${detail}.`);
     }
     fail(job, incomplete ? "runner-crash" : "wrong-outcome", detail, () =>
-      teardownIfNeeded(repo!, worktree!.path, false, true),
-    );
+      teardownIfNeeded(repo!, worktree!.path, false, true), outputTail(run.output));
   }
 
   // ---------------------------------------------------------------- GitHub (attach mode)
@@ -1019,7 +1297,10 @@ export function makeProcessJob(deps: PipelineDeps) {
       store.transition(job.id, "needs-attention", { failure_class: "logic", failure_detail: `runner "${runnerId}" is not registered` });
       return;
     }
-    const model = modelFor(config, runnerId);
+    const repoCfg = getRepoConfig(repo.path);
+    const model = modelOverrideFor(repoCfg.config, pr.labels) ?? modelFor(config, runnerId);
+    const maxTurns = repoCfg.config.maxTurns ?? undefined;
+    const previousAttempt = previousAttemptFor(job);
     const instruction = await attachInstruction(slug, pr);
 
     const wtKey = `${repo.name}-pr-${number}`;
@@ -1043,16 +1324,25 @@ export function makeProcessJob(deps: PipelineDeps) {
     });
 
     const augment = [config.promptAugmentation.global, repo.promptAugmentation].filter(Boolean).join("\n\n");
-    const prompt = buildAttachPrompt({ repo, worktree, pr, instruction });
+    const prContext = await prContextFor(slug, number);
+    const attachPrompt = (instr: string, previous?: PreviousAttempt) =>
+      buildAttachPrompt({ repo: repo!, worktree: worktree!, pr, instruction: instr, prContext, workflow: repoCfg.workflows.attach, previousAttempt: previous });
+    const prompt = attachPrompt(instruction, previousAttempt);
     store.heartbeat(job.id);
 
-    const sinks = buildSinks(job.id);
-    const { run, cancelled } = await runWithCancel(
-      job,
-      { cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent },
-      runner,
-    );
-    sinks.close();
+    const runAgent = async (p: string) => {
+      const sinks = buildSinks(job.id);
+      try {
+        return await runWithCancel(
+          job,
+          { cwd: worktree!.path, prompt: p, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent, maxTurns },
+          runner,
+        );
+      } finally {
+        sinks.close();
+      }
+    };
+    const { run, cancelled } = await runAgent(prompt);
     if (cancelled) {
       await finalizeCancelled(job, repo, worktree.path, async () => void (await addPrComment(slug, number, "Milo cancelled this run.")));
       return;
@@ -1065,17 +1355,34 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_pr_url: result.prUrl,
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
+      criteria_passed: result.criteria?.passed ?? null,
+      criteria_total: result.criteria?.total ?? null,
     });
     const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
-    const incomplete = runIncomplete(run);
+    let incomplete = runIncomplete(run);
+    let failureClass = "runner-crash";
+    let verification: VerifyOutcome[] | undefined;
 
     if (gt.codeChanged) {
+      if (!incomplete) {
+        const v = await verifyGate({ job, repoCfg, worktree, retry: (previous, instr) => runAgent(attachPrompt(instr, previous)) });
+        if (v.status === "cancelled") {
+          await finalizeCancelled(job, repo, worktree.path, async () => void addPrComment(slug, number, "Milo cancelled this run."));
+          return;
+        }
+        verification = v.outcomes;
+        if (v.status === "failed") {
+          incomplete = { reason: v.reason };
+          failureClass = "verify-failed";
+        }
+      }
+
       // Update the EXISTING PR — push follow-up commits, never open a second PR.
       if (!gt.pushed || gt.dirty) store.transition(job.id, "remediating");
       const message = incomplete ? `${ref}: follow-up (partial — run did not finish)` : `${ref}: follow-up`;
       const pushed = await ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
       if (!pushed.pushed) {
-        fail(job, "no-pr", "failed to push follow-up commits to the PR branch");
+        fail(job, "no-pr", "failed to push follow-up commits to the PR branch", undefined, outputTail(run.output));
         return;
       }
       if (pushed.committed) store.recordEvent(job.id, "remediation", { action: "milo-pushed-followup" });
@@ -1097,7 +1404,7 @@ export function makeProcessJob(deps: PipelineDeps) {
         store.transition(job.id, "needs-attention", {
           verified_outcome: "incomplete",
           pr_url: pr.url,
-          failure_class: "runner-crash",
+          failure_class: failureClass,
           failure_detail: incomplete.reason,
         });
         logger.warn({ jobId: job.id, ref, prUrl: pr.url, reason: incomplete.reason }, "attach run did not finish — needs attention");
@@ -1105,7 +1412,11 @@ export function makeProcessJob(deps: PipelineDeps) {
         return;
       }
 
-      await reportGithub(job, slug, number, { kind: "implemented", summary: result.summary, prUrl: pr.url });
+      await reportGithub(job, slug, number, {
+        kind: "implemented",
+        summary: result.summary + reportExtras(verification, result.criteria),
+        prUrl: pr.url,
+      });
       store.transition(job.id, "done", { verified_outcome: "implemented", pr_url: pr.url });
       store.recordRepoSuccess(repo.name);
       teardownIfNeeded(repo, worktree.path, true);
@@ -1122,8 +1433,7 @@ export function makeProcessJob(deps: PipelineDeps) {
 
     const detail = incomplete ? incomplete.reason : `declared ${result.outcome} but no code was produced`;
     fail(job, incomplete ? "runner-crash" : "wrong-outcome", detail, () =>
-      teardownIfNeeded(repo!, worktree!.path, false, true),
-    );
+      teardownIfNeeded(repo!, worktree!.path, false, true), outputTail(run.output));
   }
 
   // ---------------------------------------------------------------- scheduled prompt (no ticket)
@@ -1161,7 +1471,11 @@ export function makeProcessJob(deps: PipelineDeps) {
       });
       return;
     }
-    const model = job.model || modelFor(config, runnerId);
+    const repoCfg = getRepoConfig(repo.path);
+    const model = job.model || modelOverrideFor(repoCfg.config) || modelFor(config, runnerId);
+    const maxTurns = repoCfg.config.maxTurns ?? undefined;
+    const labels = prLabelsFor(repoCfg.config);
+    const previousAttempt = previousAttemptFor(job);
 
     // A per-run worktree key (entityId is stable for per-entity serialization) so each fire gets a
     // fresh branch — and therefore a fresh PR — rather than reusing/attaching to a prior one. The
@@ -1187,16 +1501,25 @@ export function makeProcessJob(deps: PipelineDeps) {
     });
 
     const augment = [config.promptAugmentation.global, repo.promptAugmentation].filter(Boolean).join("\n\n");
-    const prompt = buildFreeformPrompt({ repo, worktree, instruction: job.customPrompt ?? "" });
+    const task = job.customPrompt ?? "";
+    const freeformPrompt = (instr: string, previous?: PreviousAttempt) =>
+      buildFreeformPrompt({ repo, worktree: worktree!, instruction: instr, workflow: repoCfg.workflows.schedule, labels, previousAttempt: previous });
+    const prompt = freeformPrompt(task, previousAttempt);
     store.heartbeat(job.id);
 
-    const sinks = buildSinks(job.id);
-    const { run, cancelled } = await runWithCancel(
-      job,
-      { cwd: worktree.path, prompt, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent },
-      runner,
-    );
-    sinks.close();
+    const runAgent = async (p: string) => {
+      const sinks = buildSinks(job.id);
+      try {
+        return await runWithCancel(
+          job,
+          { cwd: worktree!.path, prompt: p, model, appendSystemPrompt: augment || undefined, logFile, echo, onEvent: sinks.onEvent, maxTurns },
+          runner,
+        );
+      } finally {
+        sinks.close();
+      }
+    };
+    const { run, cancelled } = await runAgent(prompt);
     if (cancelled) {
       await finalizeCancelled(job, repo, worktree.path); // no external thread to notify
       return;
@@ -1209,12 +1532,35 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_pr_url: result.prUrl,
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
+      criteria_passed: result.criteria?.passed ?? null,
+      criteria_total: result.criteria?.total ?? null,
     });
     const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
-    const incomplete = runIncomplete(run);
+    let incomplete = runIncomplete(run);
+    let failureClass = "runner-crash";
+    let verification: VerifyOutcome[] | undefined;
 
     if (gt.codeChanged) {
+      if (!incomplete) {
+        const v = await verifyGate({
+          job,
+          repoCfg,
+          worktree,
+          retry: (previous, instr) => runAgent(freeformPrompt(`${instr}\n\nThe original task, for context:\n\n${task}`, previous)),
+        });
+        if (v.status === "cancelled") {
+          await finalizeCancelled(job, repo, worktree.path);
+          return;
+        }
+        verification = v.outcomes;
+        if (v.status === "failed") {
+          incomplete = { reason: v.reason };
+          failureClass = "verify-failed";
+        }
+      }
+
       let prUrl: string;
+      let remediated = false;
       try {
         if (!gt.prUrl) store.transition(job.id, "remediating");
         const ensured = await ensurePr({
@@ -1226,18 +1572,23 @@ export function makeProcessJob(deps: PipelineDeps) {
           summary: result.summary,
           // No ticket to auto-close — omit the `Closes` line.
           incomplete,
+          labels,
+          criteria: result.criteria,
+          verification,
         });
         prUrl = ensured.prUrl;
+        remediated = ensured.remediated;
         if (ensured.remediated) store.recordEvent(job.id, "remediation", { action: "milo-created-pr", prUrl });
       } catch (err) {
-        fail(job, "no-pr", (err as Error).message);
+        fail(job, "no-pr", (err as Error).message, undefined, outputTail(run.output));
         return;
       }
+      if (incomplete && !remediated) await markPrIncomplete(worktree.path, prUrl, incomplete.reason);
       if (incomplete) {
         store.transition(job.id, "needs-attention", {
           verified_outcome: "incomplete",
           pr_url: prUrl,
-          failure_class: "runner-crash",
+          failure_class: failureClass,
           failure_detail: incomplete.reason,
         });
         logger.warn({ jobId: job.id, schedule: ref, prUrl, reason: incomplete.reason }, "scheduled prompt did not finish — draft PR");
@@ -1261,8 +1612,7 @@ export function makeProcessJob(deps: PipelineDeps) {
 
     const detail = incomplete ? incomplete.reason : `declared ${result.outcome} but no code was produced`;
     fail(job, incomplete ? "runner-crash" : "wrong-outcome", detail, () =>
-      teardownIfNeeded(repo, worktree!.path, false, true),
-    );
+      teardownIfNeeded(repo, worktree!.path, false, true), outputTail(run.output));
   }
 
   // ---------------------------------------------------------------- dispatch
