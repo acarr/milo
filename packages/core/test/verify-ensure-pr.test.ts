@@ -68,18 +68,18 @@ function worktree(opts: { dirty?: boolean } = {}) {
 }
 
 /** Run ensurePr and return the argv the fake `gh` was invoked with. */
-function capture(input: Parameters<typeof ensurePr>[0]) {
+async function capture(input: Parameters<typeof ensurePr>[0]) {
   const argvFile = join(mkdtempSync(join(os.tmpdir(), "milo-argv-")), "argv.json");
   process.env["MILO_TEST_GH_ARGV"] = argvFile;
-  const res = ensurePr(input);
+  const res = await ensurePr(input);
   assert.ok(existsSync(argvFile), "gh pr create should have been invoked");
   const argv = JSON.parse(readFileSync(argvFile, "utf8")) as string[];
   return { res, argv, body: argv[argv.indexOf("--body") + 1]!, title: argv[argv.indexOf("--title") + 1]! };
 }
 
-test("a finished run opens a ready PR whose body describes the commits", () => {
+test("a finished run opens a ready PR whose body describes the commits", async () => {
   const wt = worktree();
-  const { res, argv, body, title } = capture({
+  const { res, argv, body, title } = await capture({
     worktreePath: wt,
     baseBranch: "main",
     branch: "feature/x",
@@ -98,9 +98,9 @@ test("a finished run opens a ready PR whose body describes the commits", () => {
   assert.match(body, /Closes TST-9/);
 });
 
-test("an unfinished run is drafted, titled `[incomplete]`, and says why", () => {
+test("an unfinished run is drafted, titled `[incomplete]`, and says why", async () => {
   const wt = worktree({ dirty: true });
-  const { argv, body, title } = capture({
+  const { argv, body, title } = await capture({
     worktreePath: wt,
     baseBranch: "main",
     branch: "feature/x",
@@ -121,9 +121,9 @@ test("an unfinished run is drafted, titled `[incomplete]`, and says why", () => 
   assert.match(body, /## Files changed/);
 });
 
-test("the dirty tree of an unfinished run is committed as partial", () => {
+test("the dirty tree of an unfinished run is committed as partial", async () => {
   const wt = worktree({ dirty: true });
-  capture({
+  await capture({
     worktreePath: wt,
     baseBranch: "main",
     branch: "feature/x",
@@ -136,7 +136,7 @@ test("the dirty tree of an unfinished run is committed as partial", () => {
   assert.equal(git(wt, "status", "--porcelain"), "", "nothing left uncommitted");
 });
 
-test("an existing PR is reused, never duplicated", () => {
+test("an existing PR is reused, never duplicated", async () => {
   const wt = worktree();
   // `gh pr list` returning a PR means the agent already opened one.
   writeFileSync(
@@ -155,7 +155,7 @@ console.log("https://github.com/acme/repo/pull/999");
   const argvFile = join(mkdtempSync(join(os.tmpdir(), "milo-argv-")), "argv.json");
   process.env["MILO_TEST_GH_ARGV"] = argvFile;
 
-  const res = ensurePr({
+  const res = await ensurePr({
     worktreePath: wt,
     baseBranch: "main",
     branch: "feature/x",

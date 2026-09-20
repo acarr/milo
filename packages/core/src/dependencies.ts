@@ -79,11 +79,14 @@ function parsePrUrl(url: string | null): { slug: string; number: number } | unde
  * The blocker PR's state — MERGED is the signal `wait` mode waits for; CLOSED (without merging)
  * means waiting would deadlock. UNKNOWN (unparseable URL / `gh` error) keeps the gate as-is.
  */
-function blockerPrState(prUrl: string | null, fetch: typeof fetchPr): "MERGED" | "CLOSED" | "OPEN" | "UNKNOWN" {
+async function blockerPrState(
+  prUrl: string | null,
+  fetch: typeof fetchPr,
+): Promise<"MERGED" | "CLOSED" | "OPEN" | "UNKNOWN"> {
   const parsed = parsePrUrl(prUrl);
   if (!parsed) return "UNKNOWN";
   try {
-    const state = fetch(parsed.slug, parsed.number)?.state;
+    const state = (await fetch(parsed.slug, parsed.number))?.state;
     return state === "MERGED" || state === "CLOSED" || state === "OPEN" ? state : "UNKNOWN";
   } catch {
     return "UNKNOWN";
@@ -264,7 +267,7 @@ export async function reconcileDependencies(deps: DependencyDeps): Promise<void>
       );
       continue;
     }
-    const prState = blockerPrState(blockerJob.prUrl, deps.fetchPr ?? fetchPr);
+    const prState = await blockerPrState(blockerJob.prUrl, deps.fetchPr ?? fetchPr);
     if (prState === "MERGED") {
       store.resolveDependency(dep.dependentEntityId, dep.blockerEntityId);
       logger.info(

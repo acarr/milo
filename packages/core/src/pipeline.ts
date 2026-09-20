@@ -627,14 +627,14 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
     });
-    const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
     const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       let prUrl: string;
       try {
         if (!gt.prUrl) store.transition(job.id, "remediating");
-        const ensured = ensurePr({
+        const ensured = await ensurePr({
           worktreePath: worktree.path,
           baseBranch: worktree.baseBranch,
           branch: worktree.branch,
@@ -902,14 +902,14 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
     });
-    const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
     const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       // Push follow-up commits to the EXISTING branch — the open PR updates itself.
       if (!gt.pushed || gt.dirty) store.transition(job.id, "remediating");
       const message = incomplete ? `${ref}: follow-up (partial — run did not finish)` : `${ref}: follow-up`;
-      const pushed = ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
+      const pushed = await ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
       if (!pushed.pushed) {
         if (sessionId) await linear.agentError(sessionId, `Milo made changes but couldn't push the follow-up to the PR branch.`);
         fail(job, "no-pr", "failed to push follow-up commits to the PR branch");
@@ -994,7 +994,7 @@ export function makeProcessJob(deps: PipelineDeps) {
     }
     if (repo.name !== job.repo) store.transition(job.id, "setting-up", { repo: repo.name });
 
-    const pr = fetchPr(slug, number);
+    const pr = await fetchPr(slug, number);
     if (!pr) {
       store.transition(job.id, "needs-attention", { failure_class: "logic", failure_detail: `PR ${slug}#${number} not found` });
       return;
@@ -1011,7 +1011,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
 
-    if (await breakerBlocked(job, repo.name, async (msg) => void addPrComment(slug, number, msg))) return;
+    if (await breakerBlocked(job, repo.name, async (msg) => void (await addPrComment(slug, number, msg)))) return;
 
     const runnerId = resolveRunner(config, repo, { labels: pr.labels, text: `${pr.title}\n${pr.body}` });
     const runner = selectRunner(runnerId);
@@ -1020,7 +1020,7 @@ export function makeProcessJob(deps: PipelineDeps) {
       return;
     }
     const model = modelFor(config, runnerId);
-    const instruction = attachInstruction(slug, pr);
+    const instruction = await attachInstruction(slug, pr);
 
     const wtKey = `${repo.name}-pr-${number}`;
     try {
@@ -1028,7 +1028,7 @@ export function makeProcessJob(deps: PipelineDeps) {
         attachWorktree(repo, wtKey, pr.headRefName, pr.baseRefName, worktreeBase(config.worktreeBase)),
       );
     } catch (err) {
-      await failWorktreeSetup(job, repo.name, err as Error, async (msg) => void addPrComment(slug, number, msg));
+      await failWorktreeSetup(job, repo.name, err as Error, async (msg) => void (await addPrComment(slug, number, msg)));
       return;
     }
     const logFile = logFilePath(ref);
@@ -1054,7 +1054,7 @@ export function makeProcessJob(deps: PipelineDeps) {
     );
     sinks.close();
     if (cancelled) {
-      await finalizeCancelled(job, repo, worktree.path, async () => void addPrComment(slug, number, "Milo cancelled this run."));
+      await finalizeCancelled(job, repo, worktree.path, async () => void (await addPrComment(slug, number, "Milo cancelled this run.")));
       return;
     }
     const result = parseResult(run.output);
@@ -1066,14 +1066,14 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
     });
-    const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
     const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       // Update the EXISTING PR — push follow-up commits, never open a second PR.
       if (!gt.pushed || gt.dirty) store.transition(job.id, "remediating");
       const message = incomplete ? `${ref}: follow-up (partial — run did not finish)` : `${ref}: follow-up`;
-      const pushed = ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
+      const pushed = await ensurePushed(worktree.path, worktree.baseBranch, worktree.branch, message);
       if (!pushed.pushed) {
         fail(job, "no-pr", "failed to push follow-up commits to the PR branch");
         return;
@@ -1087,7 +1087,7 @@ export function makeProcessJob(deps: PipelineDeps) {
         store.transition(job.id, "reporting");
         const sideKey = `${job.id}:report`;
         if (store.alreadyDid(sideKey) === undefined) {
-          addPrComment(
+          await addPrComment(
             slug,
             number,
             `⚠️ **Milo's run didn't finish** (${incomplete.reason}).\n\nPartial work has been pushed to this branch so it isn't lost, but it has NOT been verified — review it before merging.`,
@@ -1210,14 +1210,14 @@ export function makeProcessJob(deps: PipelineDeps) {
       declared_wrote_code: result.wroteCode ? 1 : 0,
       summary: result.summary,
     });
-    const gt = resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
+    const gt = await resolveGroundTruth(worktree.path, worktree.baseBranch, worktree.branch);
     const incomplete = runIncomplete(run);
 
     if (gt.codeChanged) {
       let prUrl: string;
       try {
         if (!gt.prUrl) store.transition(job.id, "remediating");
-        const ensured = ensurePr({
+        const ensured = await ensurePr({
           worktreePath: worktree.path,
           baseBranch: worktree.baseBranch,
           branch: worktree.branch,
@@ -1358,7 +1358,7 @@ export function makeProcessJob(deps: PipelineDeps) {
         ? `Milo pushed a follow-up to this PR:\n\n${r.summary}`
         : `Milo looked into this PR (no code change made):\n\n${r.summary}`;
     try {
-      addPrComment(slug, number, body);
+      await addPrComment(slug, number, body);
       store.recordSideEffect(sideKey, "report", r.prUrl);
     } catch (err) {
       logger.warn({ jobId: job.id, err: (err as Error).message }, "report to GitHub failed");
@@ -1375,9 +1375,9 @@ function latestMentionInstruction(issue: LinearIssue): string {
 }
 
 /** The instruction that triggered an attach job: the most recent `@milo` comment, else a default. */
-function attachInstruction(slug: string, pr: PullRequest): string {
+async function attachInstruction(slug: string, pr: PullRequest): Promise<string> {
   const number = pr.number;
-  const mentions = prComments(slug, number).filter((c) => /@milo\b/i.test(c.body));
+  const mentions = (await prComments(slug, number)).filter((c) => /@milo\b/i.test(c.body));
   const latest = mentions[mentions.length - 1];
   if (latest) return latest.body.replace(/@milo\b/gi, "").trim() || "Address the request in the latest comment.";
   return "Address the latest review feedback on this PR and update it accordingly.";

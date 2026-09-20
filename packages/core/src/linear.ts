@@ -62,8 +62,16 @@ function persistTokens(path: string, token: string, refreshToken?: string): void
  *  - `error`:   a delegation Linear errored because its webhook was dropped/late (the freshness-401
  *               bug). Re-surfacing it is safe — enqueue dedupes on `session:<id>`, so a session that
  *               already produced a job is a no-op and only a never-enqueued one is recovered.
+ *  - `stale`:   Linear gave up waiting for the agent to acknowledge. That is exactly the shape of a
+ *               delegation whose webhook never got answered (a blocked daemon, a dead tunnel), so it
+ *               is the case the backstop exists for — and it was the one status it could not see.
+ *               Safe for the same dedupe reason as `error`.
+ *
+ * Deliberately NOT here: `active`/`awaitingInput` (a live session someone else's process owns) and
+ * `complete` (already finished). Those are states where re-enqueueing would mean duplicate work,
+ * not recovery.
  */
-export const RECOVERABLE_AGENT_SESSION_STATUSES = new Set(["pending", "error"]);
+export const RECOVERABLE_AGENT_SESSION_STATUSES = new Set(["pending", "error", "stale"]);
 
 /** Whether an agent-session node is one Milo should claim: a recoverable status, owned by Milo's
  * app user, and attached to an issue. Pure + exported so the poll filter is unit-testable. */
