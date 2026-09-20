@@ -4,6 +4,17 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   loadConfig,
   resolveRepo,
+  resolveRepoByName,
+  resolveRunner,
+  modelFor,
+  readRepoConfig,
+  prLabelsFor,
+  modelOverrideFor,
+  routingInstruction,
+  buildPrompt,
+  buildLinearAttachPrompt,
+  branchName,
+  worktreeBase,
   openDatabase,
   JobStore,
   JobQueue,
@@ -17,6 +28,8 @@ import {
   reconcileDependencies,
   TERMINAL_STATES,
   type PersistedEvent,
+  type LinearIssue,
+  type PreviousAttempt,
 } from "@milo/core";
 import { runClaude, runCodex, makeConductorRunner, parseRunnerResult } from "@milo/runners";
 import { createClient, type JobsFilter } from "./viewmodel.js";
@@ -556,6 +569,118 @@ export async function runPrompt(name: string): Promise<number> {
   console.log(`\n[milo] ${ok ? "✓" : "✗"} ${def.name}  ${final?.state}  ${final?.prUrl ?? final?.failureDetail ?? ""}`);
   db.close();
   return ok ? 0 : 1;
+}
+
+/**
+ * `milo prompt --issue <ID> [--repo <name>] [--attempt-of <jobId>] [--attach] [--issue-file <json>]`
+ * — a DRY RUN: assemble exactly the prompt a job for this issue would send (repo `.milo/config.json`
+ * workflow, placeholders, labels, model, `<previous_attempt>` from a prior job) and print it to
+ * stdout. Nothing is enqueued and no runner starts. Metadata goes to stderr so stdout is the prompt.
+ *
+ * `--issue-file` reads the issue from a JSON file (a `LinearIssue`, minus the fields you don't care
+ * about) instead of Linear — for fixtures and repos with no Linear credentials. `--attach` renders
+ * the Linear-revision prompt against the issue's last PR (or a placeholder URL). The repo config is
+ * read in STRICT mode here: a malformed `.milo/config.json` or a missing workflow file is an error
+ * you want to see, not something to fall back from.
+ */
+export async function printPrompt(opts: {
+  issue: string;
+  repo?: string;
+  attemptOf?: string;
+  issueFile?: string;
+  attach?: boolean;
+}): Promise<number> {
+  const { config } = loadConfig();
+  const teamKey = opts.issue.split("-")[0]!;
+
+  let issue: LinearIssue;
+  if (opts.issueFile) {
+    const raw = JSON.parse(readFileSync(opts.issueFile, "utf8")) as Partial<LinearIssue>;
+    issue = {
+      id: raw.id ?? "dry-run",
+      identifier: raw.identifier ?? opts.issue,
+      title: raw.title ?? "(untitled)",
+      description: raw.description ?? "",
+      priorityLabel: raw.priorityLabel ?? "None",
+      url: raw.url ?? `https://linear.app/dry-run/issue/${opts.issue}`,
+      state: raw.state ?? { id: "dry", name: "Todo", type: "unstarted" },
+      labels: raw.labels ?? [],
+      comments: raw.comments ?? [],
+      ...(raw.attachments ? { attachments: raw.attachments } : {}),
+      ...(raw.parent ? { parent: raw.parent } : {}),
+      ...(raw.children ? { children: raw.children } : {}),
+    };
+  } else {
+    issue = await LinearClient.fromConfig().fetchIssue(opts.issue);
+  }
+
+  const repo = opts.repo ? resolveRepoByName(config, opts.repo) : resolveRepo(config, teamKey, issue.labels);
+  if (!repo) {
+    console.error(opts.repo ? `No configured repo named "${opts.repo}".` : `No configured repo for team key ${teamKey} (pass --repo <name>).`);
+    return 1;
+  }
+
+  let repoCfg;
+  try {
+    repoCfg = readRepoConfig(repo.path);
+  } catch (err) {
+    console.error(`[milo] ${repo.name}/.milo/config.json is not usable: ${(err as Error).message}`);
+    return 1;
+  }
+
+  let previousAttempt: PreviousAttempt | undefined;
+  let priorPrUrl: string | undefined;
+  if (opts.attemptOf) {
+    const store = new JobStore(openDatabase());
+    const job = store.get(opts.attemptOf);
+    if (!job) {
+      console.error(`No job ${opts.attemptOf}.`);
+      return 1;
+    }
+    previousAttempt = {
+      attempt: Math.max(1, job.attempts),
+      errorDetail: job.failureDetail ?? undefined,
+      outputTail: job.outputTail ?? undefined,
+    };
+    priorPrUrl = job.prUrl ?? undefined;
+  }
+
+  const runnerId = resolveRunner(config, repo, { labels: issue.labels, text: `${issue.title}\n${issue.description}` });
+  const model = modelOverrideFor(repoCfg.config, issue.labels) ?? modelFor(config, runnerId, repo);
+  const labels = prLabelsFor(repoCfg.config, issue.labels);
+  const worktree = {
+    path: join(worktreeBase(config.worktreeBase), issue.identifier),
+    branch: branchName(issue.identifier, issue.title),
+    baseBranch: repo.baseBranch,
+  };
+  const workflowKey = opts.attach ? "attach" : "linearIssue";
+  const workflow = repoCfg.workflows[workflowKey];
+
+  const prompt = opts.attach
+    ? buildLinearAttachPrompt({
+        repo,
+        worktree,
+        issue,
+        prUrl: priorPrUrl ?? "https://github.com/OWNER/REPO/pull/N",
+        instruction: "Address the latest feedback on this ticket and update the existing PR accordingly.",
+        workflow,
+        previousAttempt,
+      })
+    : buildPrompt({ repo, worktree, issue, routingInstruction: routingInstruction(repo, issue), workflow, labels, previousAttempt });
+
+  const meta = [
+    `repo=${repo.name}`,
+    `runner=${runnerId}`,
+    `model=${model}`,
+    `labels=${labels.join(",") || "(none)"}`,
+    `workflow=${workflow ? `${workflowKey} from ${repoCfg.config.workflows[workflowKey]}` : "built-in"}`,
+    `maxTurns=${repoCfg.config.maxTurns ?? "unlimited"}`,
+    `verify=${repoCfg.config.verifyCommand ?? "(none)"}${repoCfg.config.verifyByPath.length ? ` +${repoCfg.config.verifyByPath.length} byPath` : ""}`,
+    `previousAttempt=${previousAttempt ? `job ${opts.attemptOf}` : "none"}`,
+  ];
+  console.error(`[milo] dry run — ${meta.join("  ")}`);
+  process.stdout.write(prompt + "\n");
+  return 0;
 }
 
 /** `milo poll` — run one Linear + GitHub poll pass and enqueue any new work. */

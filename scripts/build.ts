@@ -14,7 +14,8 @@ const common = {
   format: "esm" as const,
   target: "node22",
   // Native modules + things that must resolve at runtime stay external.
-  external: ["better-sqlite3", "node:sqlite", "fsevents"],
+  // `react-devtools-core` is an optional import inside ink (only loaded when DEV=true).
+  external: ["better-sqlite3", "node:sqlite", "fsevents", "react-devtools-core"],
   banner: {
     js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);",
   },

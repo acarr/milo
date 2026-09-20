@@ -26,6 +26,14 @@ database, operations).
   the PR itself if code was written but no PR exists, writing a description from the commits + diffstat
   rather than relying on the agent's summary. Discovery-only work correctly produces no PR. A run that
   didn't finish still gets its work preserved, but as a **draft** PR + `needs-attention`, never `done`.
+  With a repo `verifyCommand` it also **runs verification** before `done`: one attach-mode retry with
+  the failure in the prompt, then the same draft-`[incomplete]` path (`failure_class: verify-failed`).
+- **Repo-owned prompts** — `<repo>/.milo/config.json` (`core/repo-config.ts`, Zod, re-read per job)
+  supplies workflow bodies (`.milo/workflows/*.md` with `{{ISSUE_ID}}`-style placeholders), PR labels
+  (+ `class:*` from the ticket), `verifyCommand`/`verifyByPath`, `model.byLabel`, `maxTurns`. Prompts are
+  header (code) + body (workflow or built-in) + footer (`MILO_RESULT`, code). Retries inject
+  `<previous_attempt>` (stored `failure_detail` + `output_tail`); attach prompts get `<pr_diff>`,
+  `<review_threads>`, `<failing_checks>` fetched by the pipeline. `milo prompt --issue <ID>` = dry run.
 - **Linear agent chat** — drives the agent-session transcript (thought → action → response) with live,
   throttled progress streaming; **revise mode** re-runs a delegated ticket against its existing branch
   instead of opening a second PR.
@@ -209,6 +217,12 @@ pnpm test             # node --test via tsx; queue + TUI + core/runner tests
   fields by regex before giving up. Losing the summary silently is worse than a slightly wrong one —
   it used to degrade a 450-char summary to `""` with nothing logged. Failures set `parseNote`, which
   the pipeline logs.
+- **The verify step must stay async.** `runVerifyCommand` uses `spawn` (detached, own process group),
+  never `spawnSync`: a 20-minute `spawnSync` would block the event loop, stop the 30s heartbeat, and the
+  lease watchdog would requeue a healthy job mid-verify. Keep it that way for anything long-running.
+- **A workflow file replaces the whole body, rules included.** Only the header blocks and the
+  `## Final output` footer are code-owned; if a repo's workflow forgets "run autonomously / never leave
+  code without a PR", the agent won't be told. The gate still enforces the PR invariant mechanically.
 - **Codex git sandbox**: under `-s workspace-write`, Codex commits via an alternate
   `GIT_OBJECT_DIRECTORY` (it can't touch the real `.git`), so the working tree is left dirty with no
   branch commit. That's fine — **the verification gate** sees the dirty tree and commits/pushes/opens the

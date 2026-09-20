@@ -21,6 +21,8 @@ export interface ClaudeRunOptions {
   guards?: Partial<GuardTimeouts>;
   /** Override the binary to spawn — a test seam so guard behavior can be exercised with a fake CLI. */
   bin?: string;
+  /** Cap on agentic turns (`--max-turns`), from the repo's `.milo/config.json`. Unlimited when unset. */
+  maxTurns?: number;
 }
 
 export interface ClaudeRunResult {
@@ -36,8 +38,14 @@ export interface ClaudeRunResult {
   errorDetail?: string;
 }
 
-/** Keys that must be unset so Claude Code uses the Max subscription (OAuth), not API billing. */
-function cleanEnv(): NodeJS.ProcessEnv {
+/**
+ * The child environment: the daemon's env minus the keys that would flip Claude Code from the Max
+ * subscription (OAuth) to API billing, plus the usual binary locations on PATH. Everything else is
+ * inherited on purpose — in particular `GH_TOKEN`, which the daemon's launchd start script exports
+ * so `gh pr create` inside the run (and in the verification gate) authenticates as the intended
+ * GitHub identity. Exported so a test can pin that guarantee.
+ */
+export function cleanEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env["ANTHROPIC_API_KEY"];
   delete env["ANTHROPIC_AUTH_TOKEN"];
@@ -74,6 +82,7 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
     "stream-json",
   ];
   if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
+  if (opts.maxTurns && Number.isFinite(opts.maxTurns) && opts.maxTurns > 0) args.push("--max-turns", String(opts.maxTurns));
   args.push(opts.prompt);
 
   mkdirSync(dirname(opts.logFile), { recursive: true });

@@ -249,8 +249,102 @@ Cron automations run in-daemon (see [scheduling.md](./scheduling.md)).
 ## `promptAugmentation`
 
 `{ "global": "…text…" }` — appended to the system prompt of every run. Per-repo augmentation
-(`repositories[].promptAugmentation`) layers after the global one. (Per-surface layering — Linear vs
-GitHub vs schedule — is a planned nice-to-have.)
+(`repositories[].promptAugmentation`) layers after the global one. For anything more than a few
+sentences, prefer a **workflow file** in the repo (below) — it replaces the phase body instead of
+appending to the system prompt.
+
+---
+
+## Per-repo config: `<repo>/.milo/config.json`
+
+The repository's own half of the contract. It lives **in the repo** (next to `.milo/schedules.json`),
+is validated with Zod (`packages/core/src/repo-config.ts`), and is **re-read at the start of every
+job**, so edits land without a daemon restart. Everything is optional: a repo with no file behaves
+exactly as before (built-in prompt text, no verify gate, no labels), so other repos are untouched.
+
+```json
+{
+  "version": 1,
+  "workflows": {
+    "linearIssue": "workflows/linear-issue.md",
+    "attach": "workflows/attach.md",
+    "schedule": null
+  },
+  "labels": ["agent-authored"],
+  "classLabelFromTicket": true,
+  "verifyCommand": "pnpm typecheck",
+  "verifyByPath": [
+    { "paths": ["packages/ios/**"], "command": "make test-ios-unit" },
+    { "paths": ["packages/android/**"], "command": "make test-android-unit" }
+  ],
+  "verifyTimeoutMs": 1200000,
+  "model": { "default": "opus", "byLabel": { "class:chore": "sonnet" } },
+  "maxTurns": null
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `version` | `1` | `1` | Schema version. |
+| `workflows.linearIssue` | path \| null | — | Phase body for a Linear-issue (create-mode) run. |
+| `workflows.attach` | path \| null | — | Phase body for attach mode: an `@milo` PR follow-up, a Linear revision, **and the gate's verify-failure retry**. |
+| `workflows.schedule` | path \| null | — | Phase body for a scheduled-prompt run. |
+| `labels` | string[] | `[]` | Labels every PR Milo opens in this repo carries — passed as `gh pr create --label a,b` by the gate, and stated in the model's PR instructions. |
+| `classLabelFromTicket` | boolean | `false` | Also copy every Linear label matching `^class:` (e.g. `class:chore`) onto the PR. |
+| `verifyCommand` | string \| null | — | Shell command the **verification gate** runs in the worktree before a job may be `done`. |
+| `verifyByPath[]` | `{ paths: glob[], command }` | `[]` | Extra verify commands, each run only when `git diff --name-only origin/<base>...HEAD` (plus uncommitted files) touches one of its globs (`**`, `*`, `?`). |
+| `verifyTimeoutMs` | number | `1200000` (20 min) | Wall-clock cap **per command**; a timeout is a failure. |
+| `model.default` | string \| null | — | Model for every run in this repo (overrides the global chain; a `[agent=…]` tag / `runner:` label still picks the *runner*). |
+| `model.byLabel` | `Record<label, model>` | `{}` | The **first issue label** (in the issue's order, case-insensitive) with an entry wins over `model.default`. |
+| `maxTurns` | number \| null | — | Passed to Claude Code as `--max-turns`. Unlimited when unset. |
+
+Resolution order for `--model`: `[agent=…]` tag / `runner:` label choose the **runner** → `model.byLabel[<first matching label>]` → `model.default` → `runnerDefaults.<runner>.modelChain[0]`. The value must be valid for the repo's runner (Claude model names for `claude`, GPT names for `codex`); a Conductor run ignores the repo override.
+
+### Workflow files
+
+A workflow `.md` is the **phase body** of the prompt. Milo always produces the header — `<context>`,
+`<linear_issue>` (or `<pull_request>` / `<task>`), `<routing>` / `<requested_change>`, the PR
+context blocks, and `<previous_attempt>` on a retry — and always produces the footer (`## Final output
+(REQUIRED)` + the `MILO_RESULT` contract). The workflow file **replaces everything between them**,
+including the built-in "Critical Rules", so the file should carry its own rules (run autonomously,
+never leave code without a PR, `outcome=discovery` for no-code tasks). Paths resolve relative to
+`<repo>/.milo/`, then `<repo>/`; absolute paths are used as-is. A missing/empty file is logged and that
+prompt falls back to the built-in text (only `milo prompt --issue` treats it as an error).
+
+Placeholders substituted in the body — anything else in `{{…}}` is left as written:
+
+| Placeholder | Value |
+|-------------|-------|
+| `{{ISSUE_ID}}` | Linear identifier (`WAZ-1234`). Linear prompts only. |
+| `{{BASE_BRANCH}}` / `{{BRANCH}}` | The worktree's base and feature branch. |
+| `{{PR_NUMBER}}` / `{{PR_URL}}` | The existing PR (attach prompts only). |
+| `{{REPO}}` | The repo's config `name`. |
+| `{{WORKING_DIRECTORY}}` | The worktree path. |
+| `{{LABELS}}` | Comma-joined PR labels (`agent-authored,class:chore`), for the model's `gh pr create --label`. |
+
+`MILO_RESULT` may additionally carry `"criteria":{"passed":n,"total":m}` when the workflow has the
+agent track acceptance criteria; Milo records it on the job, in the Linear report, and in the PR body.
+
+### The verification gate
+
+When `verifyCommand` / a matching `verifyByPath` entry is configured, the gate runs the command(s) in
+the worktree (async, under the job's heartbeat, `/bin/sh -c`, with `CI=1` and the runners' PATH
+hygiene) **after the run and before the PR is opened**. A failure gives the agent **one attach-mode
+retry** whose prompt carries the failing output in `<previous_attempt>`; then the gate re-runs. If it
+still fails, the work is preserved behind a **draft `[incomplete]` PR** (the failure in its warning)
+and the job lands in `needs-attention` with `failure_class = verify-failed`. Results are recorded on the
+job (`verify_status`, `verify_detail`) and in the Linear report. Remote (Conductor) runs skip the gate
+— their local worktree has no toolchain. See [job-lifecycle.md](./job-lifecycle.md#the-verify-step).
+
+Dry-run the whole assembly for a ticket without running anything:
+`milo prompt --issue WAZ-1234 [--repo wazzon] [--attempt-of <jobId>]` ([cli.md](./cli.md#milo-prompt)).
+
+### `GH_TOKEN` for the daemon
+
+`gh` (inside the run and in the gate) authenticates from the daemon's environment. Milo passes the
+daemon's env through to its children (only API-billing keys are stripped), so exporting `GH_TOKEN` for
+the daemon is enough to make PRs come from a specific GitHub identity. `scripts/install-launchd.sh`
+sources `$MILO_HOME/env` (KEY=value lines) at daemon start for exactly this.
 
 ---
 

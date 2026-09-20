@@ -47,7 +47,14 @@ See **[docs/reliability.md](./docs/reliability.md)**.
 - **Isolated execution** — each job runs in its own git worktree, with per-repo setup and teardown.
 - **Two runners** — Claude Code (default) or Codex, selected per-issue/label/repo, on your subscription.
 - **Verification gate** — Milo checks real git/`gh` state, not the agent's word, and opens the PR itself
-  if code was written but no PR exists.
+  if code was written but no PR exists. With a `verifyCommand` in the repo's `.milo/config.json` it also
+  **runs your typecheck/tests before `done`**, gives the agent one retry with the failure in the prompt,
+  and parks anything still red behind a draft `[incomplete]` PR.
+- **Repo-owned workflows** — `<repo>/.milo/config.json` + `.milo/workflows/*.md` let each repository own
+  the prompt's phase body (acceptance-criteria checklists, its own verify recipe), PR labels
+  (`agent-authored`, `class:*` from the ticket), and model-by-label — re-read every job, no restart.
+  Retries carry the previous attempt's error + output tail; attach runs see the PR diff, unresolved
+  review threads and failing checks. `milo prompt --issue <ID>` prints the assembled prompt as a dry run.
 - **Linear agent chat** — drives the agent-session transcript (thought → action → response) and moves
   the ticket to *In Review*, streaming live progress as it works.
 - **Reliability core** — durable queue, bounded concurrency, per-entity serialization, retries with

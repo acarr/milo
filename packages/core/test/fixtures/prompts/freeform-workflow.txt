@@ -1,0 +1,23 @@
+<context>
+  <repository>wazzon</repository>
+  <working_directory>/wt/WAZ-1234</working_directory>
+  <base_branch>main</base_branch>
+  <branch>feature/waz-1234-add-thing</branch>
+  <package_manager>pnpm</package_manager>
+</context>
+
+<task>
+Tidy the TODOs.
+</task>
+
+Do it on feature/waz-1234-add-thing then label agent-authored.
+
+## Final output (REQUIRED)
+As the very last line of your response, print one line of machine-readable JSON, prefixed exactly
+with `MILO_RESULT=` and nothing after it, e.g.:
+
+MILO_RESULT={"outcome":"implemented","wroteCode":true,"prUrl":"https://github.com/OWNER/wazzon/pull/123","summary":"Did X; verify passed."}
+
+Where outcome is one of "implemented" | "discovery" | "blocked", wroteCode is a boolean, prUrl is the
+PR URL (or null), and summary is one or two sentences. If you tracked acceptance criteria, also include
+`"criteria":{"passed":<n>,"total":<m>}`.

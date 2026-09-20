@@ -35,13 +35,25 @@ self-report**. It resolves the authoritative state and acts on *that*.
 | `pushed` | `git rev-list --count @{u}..HEAD == 0` (nothing unpushed) |
 | `prUrl` / `prState` | `gh pr list --head <branch> --state all --json url,state` (newest) |
 
+### The verify step (opt-in per repo)
+
+Ground truth says *whether* code exists; it says nothing about whether it works. When a repo's
+`.milo/config.json` sets `verifyCommand` (and/or path-matched `verifyByPath` entries), the gate runs
+them in the worktree before anything ships: a failure earns the agent **one** attach-mode retry whose
+prompt carries the failing output; a second failure ships the work as a **draft `[incomplete]` PR** and
+parks the job in `needs-attention` (`failure_class: verify-failed`). The gate never loops and never
+weakens the check — a red verify cannot become `done`. Details and the state diagram:
+[job-lifecycle.md → The verify step](./job-lifecycle.md#the-verify-step).
+
 ### `ensurePr(...)` — create mode
 The guarantee that written code gets a PR:
 
 1. Resolve ground truth.
-2. PR already exists → return it (`remediated: false`).
+2. PR already exists → return it (`remediated: false`). If the run was incomplete, the PR is converted
+   to a draft and the warning is left as a comment (best-effort).
 3. No PR but code changed → `git add -A` (if dirty), `git commit`, `git push -u origin HEAD`,
-   `gh pr create --base <base> --head <branch> --title … --body "<summary>\n\nCloses <ref>\n\n_PR opened by Milo's verification gate._"`,
+   `gh pr create --base <base> --head <branch> --title … --body … [--draft] [--label a,b]` (body =
+   summary + commits + diffstat + `## Acceptance criteria` + `## Verification` + `Closes <ref>`),
    then return the URL (`remediated: true`).
 
 ### `ensurePushed(...)` — attach mode

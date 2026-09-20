@@ -4,6 +4,8 @@ export interface RunnerResult {
   wroteCode: boolean;
   prUrl: string | null;
   summary: string;
+  /** Optional acceptance-criteria tally, when the workflow asked the agent to track one. */
+  criteria?: { passed: number; total: number };
   /**
    * Set when a `MILO_RESULT=` line was present but did not parse cleanly. The caller logs it —
    * silently degrading to an empty summary is how a good 450-character summary disappeared into
@@ -74,12 +76,22 @@ function scrapeFields(s: string): Partial<RunnerResult> | undefined {
   return out;
 }
 
+/** `{passed, total}` with both finite non-negative integers, else undefined (never trust the shape). */
+function criteriaOf(raw: unknown): { passed: number; total: number } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const { passed, total } = raw as { passed?: unknown; total?: unknown };
+  const ok = (n: unknown): n is number => typeof n === "number" && Number.isInteger(n) && n >= 0;
+  return ok(passed) && ok(total) ? { passed, total } : undefined;
+}
+
 function shape(parsed: Partial<RunnerResult>, parseNote?: string): RunnerResult {
+  const criteria = criteriaOf(parsed.criteria);
   return {
     outcome: parsed.outcome ?? "implemented",
     wroteCode: parsed.wroteCode ?? true,
     prUrl: parsed.prUrl ?? null,
     summary: parsed.summary ?? "",
+    ...(criteria ? { criteria } : {}),
     ...(parseNote ? { parseNote } : {}),
   };
 }

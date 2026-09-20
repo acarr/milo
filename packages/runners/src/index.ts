@@ -16,7 +16,7 @@ export interface Runner {
   run(ctx: RunContext): AsyncIterable<unknown>;
 }
 
-export { runClaude } from "./claude.js";
+export { runClaude, cleanEnv as claudeEnv } from "./claude.js";
 export type { ClaudeRunOptions, ClaudeRunResult } from "./claude.js";
 export { runCodex } from "./codex.js";
 export type { CodexRunOptions, CodexRunResult } from "./codex.js";

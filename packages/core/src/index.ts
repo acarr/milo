@@ -18,6 +18,7 @@ export * from "./progress.js";
 export * from "./transcript.js";
 export * from "./scheduler.js";
 export * from "./repo-schedules.js";
+export * from "./repo-config.js";
 export * from "./maintenance.js";
 export * from "./webhooks.js";
 export * from "./daemon-state.js";

@@ -141,6 +141,15 @@ export interface Job {
   remoteSawWorking: boolean;
   /** Last tracker poll of a parked remote job — the liveness signal for `reclaimStalledRemote`. */
   remotePolledAt: number | null;
+  /** Verification gate result for the latest run: `passed` | `failed` | `skipped`. */
+  verifyStatus: string | null;
+  /** One line per verify command (and the failing command's output tail). */
+  verifyDetail: string | null;
+  /** The last ~50 lines of the previous run's output — the retry prompt's `<previous_attempt>`. */
+  outputTail: string | null;
+  /** Acceptance-criteria tally from `MILO_RESULT`, when the agent reported one. */
+  criteriaPassed: number | null;
+  criteriaTotal: number | null;
   createdAt: number;
   updatedAt: number;
   terminalAt: number | null;
@@ -223,6 +232,11 @@ const ROW_TO_JOB = (r: any): Job => ({
   remoteCursor: r.remote_cursor ?? null,
   remoteSawWorking: !!r.remote_saw_working,
   remotePolledAt: r.remote_polled_at ?? null,
+  verifyStatus: r.verify_status ?? null,
+  verifyDetail: r.verify_detail ?? null,
+  outputTail: r.output_tail ?? null,
+  criteriaPassed: r.criteria_passed ?? null,
+  criteriaTotal: r.criteria_total ?? null,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   terminalAt: r.terminal_at,
@@ -488,6 +502,7 @@ export class JobStore {
         // workspace id is kept so the runner can reuse the warm clone instead of re-cloning.
         `UPDATE jobs SET state='queued', attempts=0, next_eligible_at=NULL, lease_owner=NULL,
            lease_expires_at=NULL, failure_class=NULL, failure_detail=NULL, terminal_at=NULL,
+           output_tail=NULL, verify_status=NULL, verify_detail=NULL,
            cancel_requested=0, cancel_requested_at=NULL,
            remote_session_id=NULL, remote_cursor=NULL, remote_saw_working=NULL, updated_at=@t
          WHERE id=@id`,
@@ -533,6 +548,15 @@ export class JobStore {
     this.db
       .prepare("UPDATE jobs SET last_heartbeat_at=@t, lease_expires_at=@exp WHERE id=@id")
       .run({ t, exp: t + leaseMs, id });
+  }
+
+  /**
+   * Remember the tail of a run's output on the job row, so the NEXT attempt's prompt can show the
+   * agent what the last one hit (`<previous_attempt>`). Called before `scheduleRetry`, which keeps
+   * the column; `retry()` (a manual re-queue) clears it along with the failure detail.
+   */
+  recordRunOutput(id: string, tail: string | null): void {
+    this.db.prepare("UPDATE jobs SET output_tail=@tail, updated_at=@t WHERE id=@id").run({ tail, t: this.now(), id });
   }
 
   /** Schedule a retry with backoff: back to queued, attempts++, eligible after delayMs. */

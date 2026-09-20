@@ -1,0 +1,61 @@
+<context>
+  <repository>wazzon</repository>
+  <working_directory>/wt/WAZ-1234</working_directory>
+  <base_branch>main</base_branch>
+  <branch>feature/waz-1234-add-thing</branch>
+  <package_manager>pnpm</package_manager>
+</context>
+
+<linear_issue>
+  <identifier>WAZ-1234</identifier>
+  <title>Add the thing</title>
+  <url>https://linear.app/wazzon/issue/WAZ-1234</url>
+  <existing_pull_request>https://github.com/octave-partners/wazzon/pull/77</existing_pull_request>
+  <description>
+As a user I want the thing.
+
+## Acceptance criteria
+- it exists
+- it works
+  </description>
+  <comments>
+[Alex — 2026-09-01T10:00:00Z]:
+Please keep it small.
+
+[Ripley — 2026-09-02T10:00:00Z]:
+@milo go
+  </comments>
+</linear_issue>
+
+<failing_checks>
+- CI: iOS
+</failing_checks>
+
+<requested_change>
+Verification failed; make it pass.
+</requested_change>
+
+<previous_attempt>
+  <attempt>1</attempt>
+  This is attempt 2 of this job. Attempt 1 did not succeed. Read the error and the
+  output tail below, fix the root cause first, and do not repeat the same approach blindly.
+  <error>
+Verification gate failed:
+✗ `pnpm typecheck` (exit 2, 41s)
+  </error>
+  <output_tail>
+error TS2345
+  </output_tail>
+</previous_attempt>
+
+Revise PR #77 (https://github.com/octave-partners/wazzon/pull/77) for WAZ-1234 on feature/waz-1234-add-thing.
+
+## Final output (REQUIRED)
+As the very last line of your response, print one line of machine-readable JSON, prefixed exactly
+with `MILO_RESULT=` and nothing after it, e.g.:
+
+MILO_RESULT={"outcome":"implemented","wroteCode":true,"prUrl":"https://github.com/octave-partners/wazzon/pull/77","summary":"Addressed the requested revision; verify passed."}
+
+Where outcome is one of "implemented" | "discovery" | "blocked", wroteCode is a boolean, prUrl is the
+PR URL, and summary is one or two sentences. If you tracked acceptance criteria, also include
+`"criteria":{"passed":<n>,"total":<m>}`.
