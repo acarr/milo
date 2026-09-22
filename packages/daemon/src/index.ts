@@ -22,6 +22,22 @@ export { startWebhookServer } from "./webhook-server.js";
 import { fileURLToPath } from "node:url";
 
 /**
+ * Another daemon already holds the singleton lock, so this process stands down.
+ *
+ * This is the EXPECTED outcome for the whole time a previous daemon drains in-flight jobs after a
+ * `milo restart`: launchd's KeepAlive respawns a replacement every ~10s until the old one exits.
+ * Reporting each of those as a crash filled `daemon.log` with `level:50 "milo daemon crashed"` for
+ * the entire drain, which buried real failures. Typed so the entry point can stand down quietly
+ * on this one and stay loud about everything else.
+ */
+export class DaemonAlreadyRunningError extends Error {
+  constructor(readonly holderPid?: number) {
+    super(`milo daemon is already running${holderPid !== undefined ? ` (pid ${holderPid})` : ""}`);
+    this.name = "DaemonAlreadyRunningError";
+  }
+}
+
+/**
  * The long-lived Milo daemon: continuously drains the job queue with managed concurrency.
  * Started by launchd (RunAtLoad+KeepAlive) or `milo daemon`. The CLI/TUI observe via the
  * shared SQLite DB (WAL allows concurrent reads), so no HTTP is needed until Phase 6 webhooks.
@@ -30,10 +46,7 @@ export async function startDaemon(): Promise<void> {
   // Singleton guard (MILO-13): an OS-level exclusive lock, acquired before touching the DB,
   // binding ports, or polling — so N concurrent `milo daemon`s can never double-process.
   const guard = acquireDaemonLock();
-  if (!guard.acquired) {
-    const holder = guard.holderPid !== undefined ? ` (pid ${guard.holderPid})` : "";
-    throw new Error(`milo daemon is already running${holder}`);
-  }
+  if (!guard.acquired) throw new DaemonAlreadyRunningError(guard.holderPid);
   const { config } = loadConfig();
   const db = openDatabase();
   const store = new JobStore(db);
@@ -110,6 +123,13 @@ export async function startDaemon(): Promise<void> {
 const invokedDirectly = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (invokedDirectly) {
   startDaemon().catch((err) => {
+    // Losing the singleton race is normal while a previous daemon drains — stand down quietly so a
+    // KeepAlive respawn loop doesn't drown daemon.log in false alarms. launchd retries until the
+    // lock frees, which is exactly the handover we want.
+    if (err instanceof DaemonAlreadyRunningError) {
+      logger.info({ holderPid: err.holderPid }, "milo daemon: another daemon holds the lock — standing down");
+      process.exit(0);
+    }
     logger.error({ err: (err as Error).message }, "milo daemon crashed");
     process.exit(1);
   });

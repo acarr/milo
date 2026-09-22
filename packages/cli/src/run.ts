@@ -203,6 +203,12 @@ function spawnDetachedDaemon(): void {
 export interface DaemonControlDeps {
   spawnDaemon?: () => void;
   isLaunchd?: () => boolean;
+  /** `launchctl kickstart -k` (SIGTERM + relaunch). Returns false on failure. Stubbed in tests. */
+  kickstart?: () => boolean;
+  /** How long `restart` waits for a fresh pid before reporting a drain. Shortened in tests. */
+  liveWaitMs?: number;
+  /** How long `stop` waits for the daemon to exit before reporting a drain. Shortened in tests. */
+  stopWaitMs?: number;
 }
 
 /**
@@ -241,11 +247,10 @@ export async function stopDaemon(args: string[] = [], deps: DaemonControlDeps = 
     }
   }
 
-  const gone = await waitFor(() => !pidAlive(info.pid), force ? 10_000 : 60_000);
+  const gone = await waitFor(() => !pidAlive(info.pid), deps.stopWaitMs ?? (force ? 10_000 : 60_000));
   if (!gone) {
-    console.error(
-      `[milo] daemon (pid ${info.pid}) is still running — likely draining a long job. Re-run with --force to SIGKILL it.`,
-    );
+    reportDrain(info.pid, "before it exits");
+    console.error("[milo] it is still running — re-run with --force to SIGKILL it.");
     return 1;
   }
   console.log("[milo] daemon stopped.");
@@ -253,23 +258,69 @@ export async function stopDaemon(args: string[] = [], deps: DaemonControlDeps = 
 }
 
 /**
+ * Print what a stopping daemon is still working through.
+ *
+ * Best-effort and read-only: a stop or restart must never fail because we couldn't open the DB to
+ * write a nicer message.
+ */
+function reportDrain(pid: number, suffix: string): void {
+  let jobs: string[] = [];
+  try {
+    const client = createClient();
+    try {
+      jobs = client.jobs({ state: "active" }).map((j) => `${j.ref} (${j.state}, ${j.repo})`);
+    } finally {
+      client.close();
+    }
+  } catch {
+    /* fall back to the pid-only message */
+  }
+  console.log(
+    jobs.length > 0
+      ? `[milo] daemon (pid ${pid}) is finishing ${jobs.length} in-flight job(s) ${suffix}:`
+      : `[milo] daemon (pid ${pid}) is still shutting down ${suffix}.`,
+  );
+  for (const j of jobs) console.log(`[milo]   - ${j}`);
+}
+
+/**
  * `milo restart [--force]` — restart the daemon so it picks up new code.
  * launchd-managed: `launchctl kickstart -k`. Manual: graceful stop, then re-spawn detached.
  * Not running: just start it. Always confirms liveness (a fresh pid in daemon.pid) before returning.
+ *
+ * A stop is a SIGTERM, and the daemon's handler deliberately DRAINS in-flight jobs before exiting —
+ * which can take hours on a long run. So "no fresh pid within 30s" is the normal shape of a restart
+ * issued mid-job, not a failure; report the drain instead. `--force` is the way to not wait.
  */
 export async function restartDaemon(args: string[] = [], deps: DaemonControlDeps = {}): Promise<number> {
+  const force = args.includes("--force");
   const isLaunchd = deps.isLaunchd ?? launchdLoaded;
   const spawnDaemon = deps.spawnDaemon ?? spawnDetachedDaemon;
+  const liveWaitMs = deps.liveWaitMs ?? 30_000;
   const info = readDaemon();
   const running = info !== undefined && pidAlive(info.pid);
   const oldPid = running ? info.pid : undefined;
+  // Resolve once: the drain report below hinges on whether anything will restart the daemon for us.
+  const managed = running && isLaunchd();
 
-  if (running && isLaunchd()) {
+  if (managed) {
     console.log(`[milo] daemon (pid ${oldPid}) is launchd-managed — kickstarting ${LAUNCHD_LABEL}…`);
-    const r = spawnSync("launchctl", ["kickstart", "-k", launchdTarget()], { stdio: "inherit" });
-    if (r.status !== 0) {
+    const kickstart =
+      deps.kickstart ??
+      (() => spawnSync("launchctl", ["kickstart", "-k", launchdTarget()], { stdio: "inherit" }).status === 0);
+    if (!kickstart()) {
       console.error("[milo] launchctl kickstart failed");
       return 1;
+    }
+    // `kickstart -k` only SIGTERMs, and launchd does not reliably escalate a draining job — so
+    // without this, `--force` was silently a no-op on the launchd path.
+    if (force && oldPid !== undefined && pidAlive(oldPid)) {
+      console.log(`[milo] --force: SIGKILLing the draining daemon (pid ${oldPid})…`);
+      try {
+        process.kill(oldPid, "SIGKILL");
+      } catch {
+        /* exited in between */
+      }
     }
   } else {
     if (running) {
@@ -285,8 +336,23 @@ export async function restartDaemon(args: string[] = [], deps: DaemonControlDeps
   const ok = await waitFor(() => {
     const d = readDaemon();
     return d !== undefined && d.pid !== oldPid && pidAlive(d.pid);
-  }, 30_000);
+  }, liveWaitMs);
   if (!ok) {
+    // The old daemon outliving the window means it's draining, not wedged. Reporting a failure here
+    // sent people hunting through daemon.log for a problem that didn't exist. Whether that's a
+    // SUCCESS depends on who brings the daemon back: launchd's KeepAlive will, once the lock frees,
+    // so the restart really is just in progress. A manual daemon has nobody to do that — the
+    // replacement can't be spawned while the old one holds the lock, so that stays an error.
+    if (oldPid !== undefined && pidAlive(oldPid)) {
+      reportDrain(oldPid, managed ? "before it restarts" : "and is still holding the daemon lock");
+      if (managed) {
+        console.log("[milo] launchd restarts it automatically once they finish; no new work starts until then.");
+        console.log("[milo] `milo restart --force` kills them now (the lease watchdog requeues anything stranded).");
+        return 0;
+      }
+      console.error("[milo] nothing will restart it automatically — re-run `milo restart --force`, or wait and retry.");
+      return 1;
+    }
     console.error(`[milo] daemon did not come back within 30s — check ${join(logsDir(), "daemon.log")}`);
     return 1;
   }
