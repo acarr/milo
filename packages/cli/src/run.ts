@@ -59,8 +59,17 @@ export async function runIssues(issueIds: string[]): Promise<number> {
       entityId: issueId,
       triggerType: "issue.start",
       repo: repoGuess,
+      // An explicit `milo <ID>` re-arms a job the circuit breaker abandoned. Without this it just
+      // printed `deduped (job <id>, state abandoned)` and did nothing — the CLI passes no
+      // contentHash, so its identity key is a constant for the life of the ticket.
+      requeueTerminal: true,
     });
     console.log(`[milo] ${issueId}: ${disposition} (job ${job.id}, state ${job.state})`);
+    // Every other terminal state really did happen, so it needs a fresh run, not a re-arm. Say so —
+    // a bare `deduped` left people staring at a ticket that was never going to move.
+    if (disposition === "deduped" && TERMINAL_STATES.includes(job.state)) {
+      console.log(`[milo]   ^ already ${job.state} — it will not re-run. Use: milo rerun ${job.id}`);
+    }
   }
 
   // If the daemon is running, it owns processing — just enqueue and let it work.

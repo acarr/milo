@@ -83,6 +83,16 @@ export interface NewJob {
    */
   dedupeIfEntityActive?: boolean;
   /**
+   * Re-arm a job the circuit breaker abandoned, instead of deduping onto the dead row.
+   *
+   * Opt-in, and only ever set by an INTERACTIVE caller (`milo <ID>`). A poll tick re-emits the same
+   * constant content hash every cadence — the Linear label trigger hashes the issue identifier,
+   * GitHub's `pr.label` the PR — so wiring this into the pollers would livelock against an open
+   * breaker: requeue → claim → abandon → requeue, every 15-60s. The 30-minute cooldown is the
+   * intended rate limiter, and the recovery sweep is what respects it.
+   */
+  requeueTerminal?: boolean;
+  /**
    * Hold the job back from claiming until this timestamp (ms epoch) — a dependency-discovery
    * window (MILO-15): gives `syncDependencies` time to record `blockedBy` edges before the queue
    * can claim the job. Discovery clears the hold early (`clearEnqueueHold`) once the issue's
@@ -260,6 +270,13 @@ export class JobStore {
     if (existing) {
       const job = ROW_TO_JOB(existing);
       if (!TERMINAL_STATES.includes(job.state)) return { job, disposition: "deduped" };
+      // `abandoned` is the one terminal state that means "never actually attempted" — the repo
+      // breaker gave up before any work happened. An explicit re-trigger re-arms that same row, so
+      // its identity key, history and transcript all survive. Every other terminal state really did
+      // happen, so those still need `rerun` (a new row with a fresh content hash).
+      if (j.requeueTerminal && job.state === "abandoned" && !job.cancelRequested) {
+        return { job: this.retry(job.id), disposition: "requeued" };
+      }
       // Terminal + same content already handled — dedupe (don't re-run a completed start).
       return { job, disposition: "deduped" };
     }
@@ -699,6 +716,70 @@ export class JobStore {
          ON CONFLICT(repo) DO UPDATE SET consecutive_infra_failures=0, breaker_state='closed', opened_at=NULL, cooldown_until=NULL`,
       )
       .run(repo);
+  }
+
+  // ---- Breaker recovery: an abandoned job must not be a dead end ----
+  //
+  // A tripped breaker abandons jobs it never attempted, and nothing ever picked them back up.
+  // `recordRepoSuccess` only fires when some OTHER job for that repo succeeds — but after a storm
+  // the casualties are often the only work there is, so nothing succeeds, nothing closes the
+  // breaker, and the lazy `open → half-open` flip in `repoHealth()` never gets called either.
+  // Four wazzon tickets sat dead this way on 2026-09-22 while Docker recovered 12 minutes later.
+  //
+  // The predicate below is deliberately narrow. `failure_class='breaker'` is written at exactly one
+  // place (the pipeline's breaker gate), so a job that genuinely failed, or was cancelled, can
+  // never be swept up.
+
+  /** How far back a breaker casualty is still worth recovering. */
+  private static readonly RECOVERY_WINDOW_MS = 24 * 60 * 60_000;
+
+  /** Repos holding jobs the breaker abandoned recently enough to be worth re-arming. */
+  breakerAbandonedRepos(windowMs = JobStore.RECOVERY_WINDOW_MS): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT DISTINCT repo FROM jobs
+             WHERE state = 'abandoned' AND failure_class = 'breaker'
+               AND cancel_requested = 0 AND terminal_at >= @since`,
+        )
+        .all({ since: this.now() - windowMs }) as { repo: string }[]
+    ).map((r) => r.repo);
+  }
+
+  /**
+   * The jobs a breaker gave up on for `repo`, oldest first — they queued first, so they go first.
+   *
+   * The `terminal_at` window is a deployment guard as much as hygiene: the database already holds
+   * breaker casualties from months ago, and without it the first sweep after this ships would
+   * resurrect every one of them at once.
+   */
+  breakerAbandoned(repo: string, windowMs = JobStore.RECOVERY_WINDOW_MS): Job[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT * FROM jobs
+             WHERE state = 'abandoned' AND failure_class = 'breaker' AND repo = @repo
+               AND cancel_requested = 0 AND terminal_at >= @since
+             ORDER BY created_at ASC`,
+        )
+        .all({ repo, since: this.now() - windowMs }) as any[]
+    ).map(ROW_TO_JOB);
+  }
+
+  /**
+   * How many events of `kind` a job has recorded.
+   *
+   * This is the loop bound for auto-requeue, and it has to live in `job_events` rather than the
+   * `side_effects` ledger: a failed probe RE-OPENS the breaker with a fresh `opened_at`, so an
+   * openedAt-keyed ledger entry would happily permit a new requeue every cooldown, forever.
+   * `retry()` doesn't touch `job_events`, so this survives the reset — and it shows up in
+   * `milo job <id>`.
+   */
+  countEvents(jobId: string, kind: string): number {
+    const r = this.db
+      .prepare("SELECT COUNT(*) AS c FROM job_events WHERE job_id = ? AND kind = ?")
+      .get(jobId, kind) as any;
+    return r.c as number;
   }
 
   /** Record that a schedule fired (powers `milo schedules` history + last-run display). */

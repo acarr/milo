@@ -84,7 +84,10 @@ export function startWebhookServer(deps: WebhookDeps): () => void {
       disposition,
       reason: rawEventId,
     });
-    logger.info({ source: intent.source, entity: intent.entityRef ?? intent.entityId, disposition, jobId: job.id }, "webhook enqueued");
+    logger.info(
+      { source: intent.source, entity: intent.entityRef ?? intent.entityId, disposition, jobId: job.id, state: job.state },
+      "webhook enqueued",
+    );
     // Record/reconcile blockedBy edges for the just-enqueued work, then release its hold.
     if (disposition === "created" && intent.source === "linear") syncDeps();
     // Tell a delegation it's waiting — but only if it actually will (never claims it has started).

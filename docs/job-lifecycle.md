@@ -42,7 +42,7 @@ and `recoverOnStartup` requeues anything stranded by a crash. The model lives in
 | `discovery-done` | Genuine investigation, no code written — correctly no PR. |
 | `retrying` | Transient failure; backoff scheduled, will return to `queued`. |
 | `needs-attention` | Retries exhausted or unrecoverable; worktree kept if `teardownPolicy: keep-on-failure`. |
-| `abandoned` | Repo circuit breaker is open; the job was not attempted. |
+| `abandoned` | Repo circuit breaker is open; the job was **not attempted**. Not a dead end: the [breaker-recovery sweep](reliability.md#breaker-recovery--abandoned-is-not-a-dead-end) requeues it once the breaker is no longer open, and `milo <ID>` re-arms it on demand. After 3 automatic tries it moves to `needs-attention` with a `milo retry` hint. |
 
 ---
 
