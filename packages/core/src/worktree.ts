@@ -3,6 +3,7 @@ import { existsSync, copyFileSync, mkdirSync } from "node:fs";
 import { join, isAbsolute } from "node:path";
 import type { RepoConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { logChildExit } from "./proc.js";
 
 export interface Worktree {
   path: string;
@@ -51,7 +52,10 @@ function run(
     child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
     // `error` fires when the binary can't be spawned (e.g. ENOENT) — mirror spawnSync's failure shape.
     child.on("error", (err) => resolve({ code: 1, stdout: stdout.trim(), stderr: (stderr + String(err.message)).trim() }));
-    child.on("close", (code) => resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
+    child.on("close", (code, signal) => {
+      logChildExit({ cmd, pid: child.pid, cwd: opts.cwd }, code, signal);
+      resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() });
+    });
   });
 }
 

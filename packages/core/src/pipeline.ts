@@ -94,6 +94,11 @@ export interface RunnerFn {
     maxTurns?: number;
   }): Promise<{
     code: number;
+    /**
+     * The signal that killed the runner, when Node saw one. Optional so a runner that can't observe
+     * one (Conductor is remote) stays assignable.
+     */
+    signal?: NodeJS.Signals | null;
     output: string;
     logFile: string;
     /**
@@ -170,8 +175,14 @@ async function prContextFor(slug: string | undefined, number: number | undefined
  * event) and still exit 0, and a guard that kills a lingering-but-finished CLI exits non-zero on a
  * run that actually succeeded. So the runners report `errorDetail` explicitly and it wins.
  */
-function runIncomplete(run: { code: number; errorDetail?: string }): { reason: string } | undefined {
+export function runIncomplete(run: { code: number; signal?: NodeJS.Signals | null; errorDetail?: string }): { reason: string } | undefined {
   if (run.errorDetail) return { reason: run.errorDetail };
+  // A bare signal with no errorDetail means the kill was NOT one of Milo's own. Every guard kill
+  // sets errorDetail (which wins above), and a cancel never reaches here — the `cancelled` branch
+  // returns first. So this is something else on the box: a stray `pkill`, a `kill` from inside the
+  // run's own process group, the OOM killer. Naming the signal is what makes that diagnosable;
+  // five runs died this way over two months reported only as "the runner exited 143".
+  if (run.signal) return { reason: `the runner was killed by ${run.signal} (external)` };
   if (run.code !== 0) return { reason: `the runner exited ${run.code}` };
   return undefined;
 }
@@ -782,7 +793,7 @@ export function makeProcessJob(deps: PipelineDeps) {
     sessionId: string | undefined;
     thought: (body: string) => void;
     ref: string;
-    run: { code: number; output: string; errorDetail?: string };
+    run: { code: number; signal?: NodeJS.Signals | null; output: string; errorDetail?: string };
     cancelled: boolean;
     labels: string[];
     /** Present for local runs; undefined for remote runs (no local toolchain → gate skipped). */

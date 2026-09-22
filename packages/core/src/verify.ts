@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { delimiter } from "node:path";
 import { logger } from "./logger.js";
+import { logChildExit } from "./proc.js";
 
 /**
  * Run a child process WITHOUT blocking the event loop. The gate's work is network-bound —
@@ -17,7 +18,10 @@ function sh(cmd: string, args: string[], cwd: string): Promise<{ code: number; o
     child.stderr?.on("data", (d: Buffer) => (out += d.toString()));
     // `error` fires when the binary can't be spawned (e.g. ENOENT) — mirror spawnSync's failure shape.
     child.on("error", (e) => resolve({ code: 1, out: `${out}${e.message}`.trim() }));
-    child.on("close", (code) => resolve({ code: code ?? 1, out: out.trim() }));
+    child.on("close", (code, signal) => {
+      logChildExit({ cmd, pid: child.pid, cwd }, code, signal);
+      resolve({ code: code ?? 1, out: out.trim() });
+    });
   });
 }
 const git = (wt: string, args: string[]) => sh("git", args, wt);
@@ -318,6 +322,8 @@ export interface VerifyOutcome {
   command: string;
   passed: boolean;
   exitCode: number | null;
+  /** The signal that killed the command, when Node saw one — an OOM-killed test suite, say. */
+  signal?: NodeJS.Signals | null;
   timedOut?: boolean;
   /** Last lines of combined stdout+stderr. */
   outputTail: string;
@@ -335,15 +341,18 @@ function verifyEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function killGroup(pid: number | undefined, signal: NodeJS.Signals): void {
-  if (!pid) return;
+/** Returns true when a signal was actually delivered (so an escalation isn't logged against a corpse). */
+function killGroup(pid: number | undefined, signal: NodeJS.Signals): boolean {
+  if (!pid) return false;
   try {
     process.kill(-pid, signal);
+    return true;
   } catch {
     try {
       process.kill(pid, signal);
+      return true;
     } catch {
-      /* gone */
+      return false; /* gone */
     }
   }
 }
@@ -371,8 +380,11 @@ export function runVerifyCommand(
     });
     const timer = setTimeout(() => {
       timedOut = true;
+      logger.warn({ cwd, command, pid: child.pid, pgid: child.pid, timeoutMs: opts.timeoutMs }, "verify command timed out — killing its process group");
       killGroup(child.pid, "SIGTERM");
-      const escalate = setTimeout(() => killGroup(child.pid, "SIGKILL"), 10_000);
+      const escalate = setTimeout(() => {
+        if (killGroup(child.pid, "SIGKILL")) logger.warn({ cwd, command, pid: child.pid, pgid: child.pid }, "verify command ignored SIGTERM — escalating to SIGKILL");
+      }, 10_000);
       escalate.unref();
     }, opts.timeoutMs);
     const onData = (buf: Buffer) => {
@@ -388,12 +400,15 @@ export function runVerifyCommand(
     };
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
-    const finish = (code: number | null) => {
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       clearTimeout(timer);
+      // `detached: true` means the shell leads its own group, so pgid === pid.
+      logChildExit({ cmd: "/bin/sh", pid: child.pid, pgid: child.pid, cwd }, code, signal);
       resolve({
         command,
         passed: !timedOut && code === 0,
         exitCode: code,
+        signal: signal ?? null,
         ...(timedOut ? { timedOut: true } : {}),
         outputTail: outputTail(output, opts.tailLines ?? 50),
         durationMs: Date.now() - started,
@@ -401,9 +416,9 @@ export function runVerifyCommand(
     };
     child.on("error", (err) => {
       output += `\n[milo] could not start verify command: ${err.message}\n`;
-      finish(null);
+      finish(null, null);
     });
-    child.on("close", (code) => finish(code));
+    child.on("close", (code, signal) => finish(code, signal));
   });
 }
 
@@ -422,7 +437,7 @@ export async function runVerification(
     const outcome = await runVerifyCommand(step.command, cwd, opts);
     outcomes.push(outcome);
     if (!outcome.passed) {
-      logger.warn({ cwd, command: step.command, exit: outcome.exitCode, timedOut: outcome.timedOut }, "verification gate: FAILED");
+      logger.warn({ cwd, command: step.command, exit: outcome.exitCode, signal: outcome.signal ?? undefined, timedOut: outcome.timedOut }, "verification gate: FAILED");
       return { passed: false, outcomes };
     }
   }
@@ -432,6 +447,8 @@ export async function runVerification(
 /** One line per outcome — the job's `verify_detail` and the Linear progress note. */
 export function describeVerification(outcomes: VerifyOutcome[]): string {
   return outcomes
-    .map((o) => `${o.passed ? "✓" : "✗"} \`${o.command}\` (${o.timedOut ? "timed out" : `exit ${o.exitCode ?? "?"}`}, ${Math.round(o.durationMs / 1000)}s)`)
+    // Precedence: a timeout is ours and explains itself; otherwise a signal is more informative
+    // than the `exit ?` a signalled process would otherwise render as.
+    .map((o) => `${o.passed ? "✓" : "✗"} \`${o.command}\` (${o.timedOut ? "timed out" : o.signal ? `killed by ${o.signal}` : `exit ${o.exitCode ?? "?"}`}, ${Math.round(o.durationMs / 1000)}s)`)
     .join("\n");
 }

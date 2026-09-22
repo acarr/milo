@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { logger, withRepoGitLock } from "@milo/core";
+import { logger, logChildExit, withRepoGitLock } from "@milo/core";
 
 /**
  * Reconciling a remote run back into the local worktree.
@@ -28,7 +28,10 @@ function run(
     child.on("error", (err) =>
       resolve({ code: 1, stdout: stdout.trim(), stderr: (stderr + String(err.message)).trim() }),
     );
-    child.on("close", (code) => resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
+    child.on("close", (code, signal) => {
+      logChildExit({ cmd, pid: child.pid, cwd }, code, signal);
+      resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() });
+    });
   });
 }
 
