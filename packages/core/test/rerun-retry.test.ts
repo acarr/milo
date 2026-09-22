@@ -56,3 +56,74 @@ test("retry: refuses a non-terminal-failure job (use rerun instead)", () => {
   s.transition(job.id, "done", { pr_url: "https://example.com/pr/3" });
   assert.throws(() => s.retry(job.id), /not retryable/);
 });
+
+// --- requeueTerminal: re-arming a job the breaker abandoned ------------------------------------
+// `enqueue` used to dedupe onto ANY terminal row — both arms of its `if` returned the same thing,
+// so the terminal check was dead code. A breaker-abandoned ticket could never be re-triggered:
+// re-labelling it, re-delegating it, editing it all hit the same constant identity key, silently.
+
+/** Abandon a job the way the pipeline's breaker gate does. */
+function breakerAbandoned(s: JobStore, entityId: string) {
+  const { job } = s.enqueue({ source: "cli", entityId, triggerType: "issue.start", repo: "sandbox" });
+  s.transition(job.id, "abandoned", { failure_class: "breaker", failure_detail: "breaker open" });
+  return job;
+}
+
+test("requeueTerminal re-arms an abandoned job IN PLACE, keeping its identity and history", () => {
+  const s = store();
+  const original = breakerAbandoned(s, "SBX-RQ1");
+  s.recordEvent(original.id, "breaker-requeue", { attempt: 1 });
+
+  const res = s.enqueue({ source: "cli", entityId: "SBX-RQ1", triggerType: "issue.start", repo: "sandbox", requeueTerminal: true });
+
+  assert.equal(res.disposition, "requeued", "the declared-but-never-produced disposition finally has a producer");
+  assert.equal(res.job.id, original.id, "same row — the transcript the user is watching survives");
+  assert.equal(res.job.identityKey, original.identityKey, "identity stays derivable from the row");
+  assert.equal(res.job.state, "queued");
+  assert.equal(res.job.attempts, 0);
+  assert.equal(res.job.failureClass, null);
+  assert.equal(res.job.terminalAt, null);
+  assert.equal(s.countEvents(original.id, "breaker-requeue"), 1, "job_events survives the reset");
+});
+
+test("requeueTerminal touches ONLY abandoned — every other terminal state really happened", () => {
+  const s = store();
+  for (const [entityId, state] of [
+    ["SBX-RQ2", "done"],
+    ["SBX-RQ3", "failed"],
+    ["SBX-RQ4", "needs-attention"],
+    ["SBX-RQ5", "cancelled"],
+    ["SBX-RQ6", "discovery-done"],
+  ] as const) {
+    const { job } = s.enqueue({ source: "cli", entityId, triggerType: "issue.start", repo: "sandbox" });
+    s.transition(job.id, state);
+    const res = s.enqueue({ source: "cli", entityId, triggerType: "issue.start", repo: "sandbox", requeueTerminal: true });
+    assert.equal(res.disposition, "deduped", `${state} must still need an explicit rerun`);
+    assert.equal(res.job.state, state, "and must not be moved");
+  }
+});
+
+test("requeueTerminal does not resurrect a job the user cancelled before the breaker hit it", () => {
+  const s = store();
+  const { job } = s.enqueue({ source: "cli", entityId: "SBX-RQ7", triggerType: "issue.start", repo: "sandbox" });
+  s.requestCancel(job.id); // cancel lands while it's still queued…
+  s.transition(job.id, "abandoned", { failure_class: "breaker", failure_detail: "breaker open" }); // …then the breaker trips
+
+  const res = s.enqueue({ source: "cli", entityId: "SBX-RQ7", triggerType: "issue.start", repo: "sandbox", requeueTerminal: true });
+  assert.equal(res.disposition, "deduped", "the user said stop; it stays stopped");
+  assert.equal(res.job.state, "abandoned");
+});
+
+test("WITHOUT the flag an abandoned job still dedupes — this is what protects the pollers", () => {
+  const s = store();
+  const original = breakerAbandoned(s, "SBX-RQ8");
+
+  // The Linear label trigger re-emits the same constant content hash EVERY poll tick. If a poll
+  // requeued abandoned jobs, an open breaker would livelock: requeue → claim → abandon → requeue.
+  for (let i = 0; i < 3; i++) {
+    const res = s.enqueue({ source: "cli", entityId: "SBX-RQ8", triggerType: "issue.start", repo: "sandbox" });
+    assert.equal(res.disposition, "deduped");
+    assert.equal(res.job.state, "abandoned");
+  }
+  assert.equal(s.get(original.id)!.state, "abandoned");
+});

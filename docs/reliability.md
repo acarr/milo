@@ -120,6 +120,40 @@ closed ──(5 consecutive infra failures)──► open ──(30m cooldown el
 This stops a broken repo (bad credentials, gone-away remote, wedged setup script) from burning every
 incoming ticket.
 
+### Breaker recovery — `abandoned` is not a dead end
+
+`packages/daemon/src/breaker-recovery.ts` (`sweepBreakerRecovery`), on the daemon's existing 30s
+watchdog tick.
+
+The breaker abandons jobs it never attempted. Nothing used to bring them back, and re-triggering
+from Linear silently did nothing (the identity key dedupes onto the dead row), so a dead ticket
+looked exactly like a queued one. On 2026-09-22 four wazzon tickets sat that way while the
+underlying Docker problem fixed itself 12 minutes later.
+
+The sweep is **time-driven, not hooked to the breaker closing** — and that distinction is the whole
+fix. `recordRepoSuccess` only fires when some *other* job for the repo succeeds, but after a storm
+the casualties are usually the only work there is. Nothing succeeds, so nothing closes the breaker,
+and `repoHealth()`'s lazy `open → half-open` flip never gets called either. Calling `repoHealth()`
+on a timer **is** the flip, and the re-armed jobs become the half-open probe.
+
+- Casualties are found by `state='abandoned' AND failure_class='breaker'`, excluding
+  `cancel_requested` rows and anything older than **24h** (which also stops a first deploy
+  resurrecting months of history).
+- Each is re-armed with `JobStore.retry()` — same row, so its identity key, history and transcript
+  survive. Idempotency is **structural**: `retry()` clears `failure_class`, so the row stops
+  matching the predicate immediately.
+- After **3** automatic requeues the job is parked in **`needs-attention`** with a
+  `milo retry <jobId>` hint. The loop bound counts `breaker-requeue` rows in `job_events`, *not* a
+  `side_effects` key — a failed probe re-opens the breaker with a fresh `openedAt`, so an
+  openedAt-keyed ledger would permit a new requeue every cooldown, forever.
+- Linear is told at most once per episode (`breaker-resume:<jobId>:<openedAt>`) and once ever on
+  give-up (`breaker-giveup:<jobId>`).
+
+`milo <ID>` re-arms an abandoned job the same way (`enqueue({ requeueTerminal: true })`, disposition
+`requeued`). **Pollers deliberately do not**: the Linear label trigger re-emits the same constant
+content hash every tick, so requeueing from a poll would livelock against an open breaker
+(requeue → claim → abandon → requeue). The 30-minute cooldown is the intended rate limiter.
+
 ---
 
 ## Lease watchdog & heartbeats
@@ -147,6 +181,7 @@ needed; no risk of double-running a healthy job.
 |---------|-----------|
 | Transient infra hiccup | retry with backoff (30s/2m/8m) |
 | Repeatedly broken repo | circuit breaker (open 30m, half-open probe) |
+| Repo recovered, but its abandoned jobs are stranded | breaker-recovery sweep (30s tick) requeues them; parks in `needs-attention` after 3 tries |
 | Worker died mid-job | lease watchdog (requeue after lease + 30s grace) |
 | Daemon process crashed | launchd `KeepAlive` + `recoverOnStartup` requeues stranded jobs |
 | Agent wrote code, no PR | verification gate opens the PR |

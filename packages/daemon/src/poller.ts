@@ -1,4 +1,4 @@
-import { logger, syncDependencies, dependencyHold, type JobStore, type LinearClient, type MiloConfig } from "@milo/core";
+import { logger, syncDependencies, dependencyHold, TERMINAL_STATES, type Job, type JobStore, type LinearClient, type MiloConfig } from "@milo/core";
 import { pollLinear, pollGithub, intentToNewJob, type JobIntent } from "@milo/transports";
 import { postQueuedAckIfWaiting } from "./queued-ack.js";
 
@@ -42,12 +42,47 @@ function ingest(config: MiloConfig, store: JobStore, linear: LinearClient, sourc
       if (disposition === "created") {
         created++;
         logger.info({ source, entity: intent.entityRef ?? intent.entityId, jobId: job.id }, "poll enqueued job");
+      } else if (disposition === "deduped" && TERMINAL_STATES.includes(job.state)) {
+        noteTerminalDedupe(store, source, intent, job);
       }
     } catch (err) {
       logger.warn({ source, entity: intent.entityId, err: (err as Error).message }, "failed to enqueue polled intent");
     }
   }
   return created;
+}
+
+/**
+ * A live trigger landed on a job that already finished, or that the breaker gave up on. Dedupe
+ * means it will NOT re-run — and until now that was completely silent: nothing logged, nothing
+ * posted to Linear. Four breaker-abandoned tickets were re-labelled and re-delegated on
+ * 2026-09-22 without producing a single line anywhere, so a dead ticket looked exactly like a
+ * queued one.
+ *
+ * Rate-limited by `terminalAt`, so a `milo`-labelled done issue re-emitting its intent every
+ * cadence forever logs exactly once per terminal episode — not once per poll tick. A retry changes
+ * `terminalAt`, so the next time it dies it speaks up again.
+ *
+ * Log-only on purpose. A Linear comment here would fire for `done` too (noisy and wrong), cost a
+ * `fetchIssue` round-trip per notice, and duplicate what the recovery sweep already says.
+ */
+function noteTerminalDedupe(store: JobStore, source: string, intent: JobIntent, job: Job): void {
+  const key = `dedupe-notice:${job.id}:${job.terminalAt}`;
+  if (store.alreadyDid(key) !== undefined) return;
+  store.recordSideEffect(key, "dedupe-notice");
+  const line = {
+    source,
+    entity: intent.entityRef ?? intent.entityId,
+    jobId: job.id,
+    state: job.state,
+    trigger: intent.triggerType,
+    identityKey: job.identityKey,
+  };
+  if (["abandoned", "failed", "needs-attention"].includes(job.state)) {
+    logger.warn(line, `poll trigger deduped onto a ${job.state} job — it will NOT re-run (milo retry ${job.id})`);
+  } else {
+    logger.info(line, "poll trigger deduped onto a finished job");
+  }
 }
 
 /**

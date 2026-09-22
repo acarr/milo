@@ -120,7 +120,7 @@ Guards external writes so retries don't double-post.
 | Column | Type | Notes |
 |--------|------|-------|
 | `idempotency_key` | TEXT PK | e.g. `breaker:<repo>:<openedAt>`. |
-| `kind` | TEXT | `pr-create`, `comment`, `state-set`, `breaker-notice`, `report`. |
+| `kind` | TEXT | `pr-create`, `comment`, `state-set`, `breaker-notice`, `breaker-recovery-notice`, `dedupe-notice`, `report`. |
 | `external_id` | TEXT | PR URL, comment id, … |
 | `created_at` | INTEGER | Epoch ms. |
 

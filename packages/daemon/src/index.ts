@@ -14,11 +14,14 @@ import { startPolling } from "./poller.js";
 import { startScheduling } from "./scheduling.js";
 import { startWebhookServer } from "./webhook-server.js";
 import { startRemoteTracker } from "./remote-tracker.js";
+import { sweepBreakerRecovery } from "./breaker-recovery.js";
 
 export { startPolling, pollOnce } from "./poller.js";
 export type { PollerDeps } from "./poller.js";
 export { startScheduling, effectiveSchedules } from "./scheduling.js";
 export { startWebhookServer } from "./webhook-server.js";
+export { sweepBreakerRecovery } from "./breaker-recovery.js";
+export type { BreakerRecoveryDeps } from "./breaker-recovery.js";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -89,6 +92,17 @@ export async function startDaemon(): Promise<void> {
       if (n > 0) logger.warn({ reclaimed: n }, "watchdog reclaimed stranded job(s)");
     } catch (err) {
       logger.warn({ err: (err as Error).message }, "watchdog tick failed");
+    }
+    // Breaker recovery rides the same tick, in its OWN try/catch so a sweep failure can never stop
+    // lease reclamation. 30s is far finer than the 30-minute cooldown, which is the point: when
+    // another job's success closes a breaker, its casualties re-arm almost immediately instead of
+    // waiting out a cooldown they no longer need.
+    try {
+      void sweepBreakerRecovery({ store, linear }).catch((err) =>
+        logger.warn({ err: (err as Error).message }, "breaker recovery sweep failed"),
+      );
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, "breaker recovery sweep failed");
     }
   }, 30_000);
 
