@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { dirname, delimiter } from "node:path";
-import type { RunnerEvent, RunnerEventSink } from "@milo/core";
+import { logChildExit, type RunnerEvent, type RunnerEventSink } from "@milo/core";
 import { RunGuards, onAbortKill, type GuardTimeouts } from "./guards.js";
 import { mapStreamJsonEvent } from "./stream-json.js";
 
@@ -27,6 +27,14 @@ export interface ClaudeRunOptions {
 
 export interface ClaudeRunResult {
   code: number;
+  /**
+   * The signal that killed the runner, when Node saw one. `null` for an ordinary exit — including a
+   * process that caught the signal itself and exited 128+N, which is indistinguishable from a real
+   * `exit 143` at this layer. A bare signal here (with no `errorDetail`) means the kill came from
+   * outside Milo: our own guard kills always set `errorDetail`, and a cancel never reaches the
+   * incomplete path.
+   */
+  signal?: NodeJS.Signals | null;
   output: string;
   logFile: string;
   /**
@@ -83,22 +91,44 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
   ];
   if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
   if (opts.maxTurns && Number.isFinite(opts.maxTurns) && opts.maxTurns > 0) args.push("--max-turns", String(opts.maxTurns));
-  args.push(opts.prompt);
 
   mkdirSync(dirname(opts.logFile), { recursive: true });
   const log = createWriteStream(opts.logFile, { flags: "a" });
 
   return new Promise((resolve, reject) => {
-    // stdin: "ignore" — the prompt is passed as an arg, so closing stdin avoids
-    // claude -p's "no stdin data received in 3s" stall.
+    // stdin: "pipe" — the prompt is PIPED, not passed as an argv element, and stdin is closed
+    // immediately after (which also avoids claude -p's "no stdin data received in 3s" stall).
+    //
+    // Keeping the prompt out of argv is a safety property, not a style choice. The prompt embeds
+    // `<working_directory>/path/to/worktree`, which put that path in `ps` output — and made the
+    // runner killable by a path-matching `pkill`. The chain that exploited it, verified on disk:
+    //
+    //   any worktree created anywhere in the repo (several agent tools do this)
+    //     -> Claude Code's WorktreeCreate hook -> the repo's worktree-init.sh
+    //       -> worktree-cleanup.sh --merged-only, which enumerates EVERY worktree
+    //          `git worktree list` reports — Milo's included
+    //         -> worktree-teardown.sh -> `pkill -f "$WORKTREE_PATH"`
+    //           -> SIGTERM -> claude's own handler -> exit 143
+    //
+    // That killed five wazzon runs over two months (WAZ-1346, WAZ-1356, WAZ-1482, WAZ-1814,
+    // WAZ-1792), always 2-3s after a successful tool action, always 143 and never 137 — a plain
+    // SIGTERM, never a SIGKILL. Two of them died 4.0s apart in different worktrees, which is one
+    // cleanup pass looping over its list. `ps`/`pkill -f` cannot see stdin, so piping the prompt
+    // takes Milo out of that blast radius. Note the Codex runner is still exposed (it needs
+    // `-C <cwd>` in argv).
+    //
     // detached: true — the child leads its own process group, so the run guards can kill the whole
     // tree (claude + MCP servers + stray shells) when it hangs after finishing (MILO-16).
     const child = spawn(opts.bin ?? "claude", args, {
       cwd: opts.cwd,
       env: cleanEnv(),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       detached: true,
     });
+    // A child that dies before draining stdin gives us EPIPE; that's its `close` to report, not a
+    // crash of the daemon.
+    child.stdin.on("error", () => {});
+    child.stdin.end(opts.prompt);
     let output = "";
     let errorDetail: string | undefined;
 
@@ -128,6 +158,24 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
       opts.echo?.write(note);
       emit({ kind: "notice", text: "Cancellation requested — stopping the runner." });
     });
+
+    /**
+     * Resolve only once the run log is really flushed. `createWriteStream` opens lazily, so
+     * `log.end()` returning does NOT mean the file is written — the pipeline reads `logFile`
+     * immediately after this promise settles, and a test that cleans up its temp dir could race
+     * the open and crash with ENOENT (cancel.test.ts, ~1 run in 3).
+     */
+    const finishLog = (): Promise<void> =>
+      new Promise((res) => {
+        let settled = false;
+        const once = () => {
+          if (settled) return;
+          settled = true;
+          res();
+        };
+        log.once("error", once); // a log we can't write must never hang or crash the run
+        log.end(once);
+      });
 
     /** Append plain text to the reconstructed output + mirror it to the echo stream. */
     const appendText = (s: string) => {
@@ -190,14 +238,14 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
     child.on("error", (err) => {
       guards.clear();
       disposeAbort();
-      log.end();
-      reject(err);
+      void finishLog().then(() => reject(err));
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       guards.clear();
       disposeAbort();
       if (stdoutBuf.trim()) handleLine(stdoutBuf); // flush any partial trailing line
-      log.end();
+      // `detached: true` means the child leads its own group, so pgid === pid.
+      logChildExit({ cmd: opts.bin ?? "claude", pid: child.pid, pgid: child.pid, cwd: opts.cwd, logFile: opts.logFile }, code, signal);
       // A guard kill after the final result is still a successful run — the output is complete and
       // the pipeline's verification gate re-derives the real outcome from git/GitHub state anyway.
       // A guard kill BEFORE any result means the run was abandoned mid-flight; say so, since the
@@ -205,12 +253,16 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
       if (!errorDetail && guards.killReason && !guards.completedBeforeKill) {
         errorDetail = `runner was killed: ${guards.killReason}`;
       }
-      resolve({
+      void finishLog().then(() => resolve({
         code: guards.completedBeforeKill ? 0 : (code ?? 1),
+        // `signal` mirrors whatever `code` does — suppressed under completedBeforeKill for the same
+        // reason. A post-result guard kill IS a success, and reporting its SIGTERM here would make
+        // `runIncomplete` flip every one of them to needs-attention.
+        signal: guards.completedBeforeKill ? null : (signal ?? null),
         output,
         logFile: opts.logFile,
         ...(errorDetail ? { errorDetail } : {}),
-      });
+      }));
     });
   });
 }

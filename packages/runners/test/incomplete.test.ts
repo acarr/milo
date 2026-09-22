@@ -90,3 +90,55 @@ test("a guard kill AFTER the result is not an error — the work was already don
   assert.equal(r.errorDetail, undefined, "and must not be flagged as an unfinished run");
   rmSync(dir, { recursive: true, force: true });
 });
+
+/**
+ * External kills: who killed the runner, and can Milo tell?
+ *
+ * Node reports a signalled child as `(code=null, signal="SIGTERM")`. Every `close` handler used to
+ * bind only `code`, so that collapsed to a bare `1` and the signal was discarded. Five wazzon runs
+ * died with `exit 143` across two months — SIGTERM caught by claude's own handler, sent by a repo
+ * cleanup script's `pkill -f "<worktree path>"` — and Milo could only say "the runner exited 143".
+ */
+
+test("a post-result guard kill reports NO signal — it is still a success", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "milo-signal-"));
+  const line = JSON.stringify({
+    type: "result",
+    is_error: false,
+    result: 'MILO_RESULT={"outcome":"implemented","wroteCode":true,"prUrl":null,"summary":"ok"}',
+  });
+  const bin = fakeBin(dir, "claude-hangs-sig", `console.log(${JSON.stringify(line)}); setInterval(() => {}, 1000);`);
+
+  const r = await run(dir, bin);
+  // The guard kills this with SIGTERM, so Node DOES see a signal. Reporting it would make
+  // runIncomplete flip every post-result guard kill to needs-attention. `signal` must mirror
+  // whatever `code` does — both suppressed under completedBeforeKill.
+  assert.equal(r.code, 0);
+  assert.equal(r.signal, null, "a guard kill after the result must not look like an external kill");
+  assert.equal(r.errorDetail, undefined);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a runner killed by an outside signal reports that signal, with no errorDetail", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "milo-signal-"));
+  // Stands in for a stray `pkill -f`: the process is signalled mid-run, before any result.
+  const bin = fakeBin(dir, "claude-signalled", `setTimeout(() => process.kill(process.pid, "SIGTERM"), 50); setInterval(() => {}, 1000);`);
+
+  const r = await run(dir, bin);
+  assert.equal(r.signal, "SIGTERM");
+  assert.equal(r.code, 1, "Node reports code=null for a signal death; the runner still normalizes to 1");
+  assert.equal(r.errorDetail, undefined, "no guard fired — so the kill came from outside Milo");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a runner that exits 143 under its own power is NOT reported as signalled", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "milo-signal-"));
+  // What `claude` actually does: it catches SIGTERM and exits 128+15 itself. At this layer that is
+  // indistinguishable from a deliberate `exit 143`, so the inference stays out of the result type.
+  const bin = fakeBin(dir, "claude-143", `process.exit(143);`);
+
+  const r = await run(dir, bin);
+  assert.equal(r.code, 143);
+  assert.equal(r.signal, null);
+  rmSync(dir, { recursive: true, force: true });
+});

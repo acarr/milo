@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { logger } from "./logger.js";
+import { logChildExit } from "./proc.js";
 
 /** A pull request as Milo cares about it for attach-mode work. */
 export interface PullRequest {
@@ -34,7 +35,10 @@ function gh(args: string[], cwd?: string): Promise<{ code: number; out: string; 
     child.stderr?.on("data", (d: Buffer) => (err += d.toString()));
     // `error` fires when the binary can't be spawned (e.g. ENOENT) — mirror spawnSync's failure shape.
     child.on("error", (e) => resolve({ code: 1, out: out.trim(), err: (err + String(e.message)).trim() }));
-    child.on("close", (code) => resolve({ code: code ?? 1, out: out.trim(), err: err.trim() }));
+    child.on("close", (code, signal) => {
+      logChildExit({ cmd: "gh", pid: child.pid }, code, signal);
+      resolve({ code: code ?? 1, out: out.trim(), err: err.trim() });
+    });
   });
 }
 

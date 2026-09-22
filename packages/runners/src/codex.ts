@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, delimiter, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import type { RunnerEvent, RunnerEventSink } from "@milo/core";
+import { logChildExit, type RunnerEvent, type RunnerEventSink } from "@milo/core";
 import { RunGuards, onAbortKill, type GuardTimeouts } from "./guards.js";
 
 export interface CodexRunOptions {
@@ -26,6 +26,8 @@ export interface CodexRunOptions {
 
 export interface CodexRunResult {
   code: number;
+  /** The signal that killed the runner, when Node saw one. See {@link ClaudeRunResult.signal}. */
+  signal?: NodeJS.Signals | null;
   output: string;
   logFile: string;
   /** Why the run did not finish cleanly, when it didn't. See {@link ClaudeRunResult.errorDetail}. */
@@ -150,6 +152,10 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexRunResult> {
     // detached: true — the child leads its own process group, so the run guards can kill the whole
     // tree if it goes silent or runs forever (MILO-16). Codex has no reliable terminal stream event,
     // so only the inactivity + wall-clock guards apply (completion is signaled by process exit).
+    //
+    // NOTE: unlike the Claude runner, this argv still carries the worktree path (`-C <cwd>`, which
+    // Codex needs), so a `pkill -f "<worktree path>"` on the box can still reach a Codex run. The
+    // exit logging below is what makes that visible when it happens.
     const child = spawn(opts.bin ?? "codex", args, {
       cwd: opts.cwd,
       env: cleanEnv(),
@@ -224,9 +230,11 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexRunResult> {
       log.end();
       reject(err);
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       guards.clear();
       disposeAbort();
+      // `detached: true` means the child leads its own group, so pgid === pid.
+      logChildExit({ cmd: opts.bin ?? "codex", pid: child.pid, pgid: child.pid, cwd: opts.cwd, logFile: opts.logFile }, code, signal);
       // Append the clean final message so MILO_RESULT is parseable (JSONL escapes it otherwise).
       let lastMsg = "";
       try {
@@ -251,6 +259,7 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexRunResult> {
       const errorDetail = guards.killReason ? `runner was killed: ${guards.killReason}` : undefined;
       resolve({
         code: code ?? 1,
+        signal: signal ?? null,
         output,
         logFile: opts.logFile,
         ...(errorDetail ? { errorDetail } : {}),

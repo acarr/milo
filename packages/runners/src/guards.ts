@@ -21,6 +21,8 @@
  * signal the entire tree at once.
  */
 
+import { logger } from "@milo/core";
+
 export interface GuardTimeouts {
   /** How long a process may linger after emitting its final result before being killed. */
   resultExitGraceMs: number;
@@ -36,16 +38,23 @@ export const DEFAULT_GUARDS: GuardTimeouts = {
   maxRunMs: 3 * 60 * 60_000,
 };
 
-/** Kill a detached child's entire process group; falls back to the single pid. Safe on dead pids. */
-export function killTree(pid: number | undefined, signal: NodeJS.Signals = "SIGTERM"): void {
-  if (!pid || pid <= 0) return;
+/**
+ * Kill a detached child's entire process group; falls back to the single pid. Safe on dead pids.
+ *
+ * Returns true when a signal was actually delivered, so callers can avoid logging an escalation
+ * against a tree that had already exited.
+ */
+export function killTree(pid: number | undefined, signal: NodeJS.Signals = "SIGTERM"): boolean {
+  if (!pid || pid <= 0) return false;
   try {
     process.kill(-pid, signal); // negative pid → the whole process group
+    return true;
   } catch {
     try {
       process.kill(pid, signal);
+      return true;
     } catch {
-      /* already gone */
+      return false; /* already gone */
     }
   }
 }
@@ -67,8 +76,11 @@ export function onAbortKill(
     } catch {
       /* a notifier must never break the kill path */
     }
+    logger.warn({ pid, pgid: pid }, "cancel requested — killing runner process group");
     killTree(pid, "SIGTERM");
-    const escalate = setTimeout(() => killTree(pid, "SIGKILL"), 10_000);
+    const escalate = setTimeout(() => {
+      if (killTree(pid, "SIGKILL")) logger.warn({ pid, pgid: pid }, "runner ignored SIGTERM after cancel — escalating to SIGKILL");
+    }, 10_000);
     escalate.unref();
   };
   if (signal.aborted) {
@@ -135,9 +147,18 @@ export class RunGuards {
     } catch {
       /* a notifier must never break the kill path */
     }
+    // Until this line existed, a guard kill was recorded ONLY in the per-run log file and the job
+    // transcript — never in daemon.log. That made "did a guard fire?" unanswerable from the one
+    // place an operator looks, and the SIGKILL escalation below was silent everywhere.
+    logger.warn(
+      { pid: this.pid, pgid: this.pid, reason, completedBeforeKill: this.completedBeforeKill },
+      "run guard killing runner process group",
+    );
     killTree(this.pid, "SIGTERM");
     // A tree that ignores SIGTERM gets SIGKILL; unref so this never holds the host process open.
-    const escalate = setTimeout(() => killTree(this.pid, "SIGKILL"), 10_000);
+    const escalate = setTimeout(() => {
+      if (killTree(this.pid, "SIGKILL")) logger.warn({ pid: this.pid, pgid: this.pid, reason }, "runner ignored SIGTERM — escalating to SIGKILL");
+    }, 10_000);
     escalate.unref();
   }
 }
